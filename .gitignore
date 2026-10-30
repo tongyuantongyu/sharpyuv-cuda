@@ -1,0 +1,10 @@
+.idea
+build
+cmake-build-*
+
+.conda*
+archive
+experiments
+
+.mcp.json
+compile_commands.json
