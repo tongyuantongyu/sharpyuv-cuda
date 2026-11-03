@@ -1,4 +1,4 @@
-// Device-side transfer functions. Choices follow experiments/tf_bench/RESULTS.md:
+// Device-side transfer functions. Choices follow private/experiments/tf_bench/RESULTS.md:
 // MUFU intrinsics for parametric curves and HLG, the numerically stable
 // rewrite for PQ -> linear (a cheaper fit for <= 12-bit output), a log-log
 // fit for PQ -> encoded. Piecewise curves

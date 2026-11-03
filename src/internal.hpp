@@ -7,9 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace sharpyuv {
-class FilterInfo;
-}
+#include "sharpyuv_cuda/sharpyuv.h"
 
 namespace sharpyuv::detail {
 
@@ -39,7 +37,7 @@ inline constexpr bool kHasRows = (int32_t(kWin) & 3 & 2) != 0;
 //   tgt[oy][ox]         chroma target / feedback filter over the pixels
 //                       (2by+oy-1, 2bx+ox-1); row / column 0 (pixel -1) is
 //                       zero unless the window includes it.
-// Reference: experiments/convergence/filter_coeffs.py.
+// Reference: private/experiments/convergence/filter_coeffs.py.
 struct FilterParams {
   float up[2][2][3][3];
   float tgt[3][3];
@@ -56,11 +54,11 @@ struct TfParams {
   float ootf_dec_exp, ootf_enc_exp, ootf_inv_gamma;
 };
 
-// Color constants for one SetColorInfo().
+// Constants of one syc_session_init: signal and decoder filter.
 struct ColorParams {
   TfKind tf;
-  Window window;        // set per Convert from the session's filter
-  FilterParams filter;  // set per Convert from the session's filter
+  Window window;
+  FilterParams filter;
   TfParams tfp;
   float kl[3];  // linear-light luminance weights (from CP)
   float km[3];  // Y'CbCr luma weights (from MC)
@@ -122,18 +120,29 @@ inline constexpr int32_t kMaxHalo = 6;
 // Internal overrides for benchmarks and tests (not public API).
 struct KernelConfig {
   int32_t tile = 0;    // tile edge in blocks: 16 or 32; 0: chosen per image
-  int32_t halo = -1;   // 0 .. kMaxHalo; < 0: from the session (FilterInfo::exact)
+  int32_t halo = -1;   // 0 .. kMaxHalo; < 0: from the session (syc_session::exact)
   // PQ decode: < 0 by output depth (cheaper fit for <= 12-bit); 0: always the
   // stable form; 1: always the fit.
   int32_t pq_fast = -1;
 };
 
-// Process-wide; read by Session::Convert. Not thread-safe: set it before
+// Process-wide; read by syc_session_convert. Not thread-safe: set it before
 // converting (benchmarks, tests).
 KernelConfig& InternalKernelConfig();
 
-// Tables and window of a specified FilterInfo (filter.cpp).
-void BuildFilterParams(const FilterInfo& f, FilterParams* out, Window* window);
+// Validation shared by the factories and syc_session_init (color.cpp).
+bool ValidWeights(double kr, double kb);
+bool ValidCurve(const syc_parametric_curve& c);
+
+// Normalized weights of a decoder filter mixture, [kind - 1][location - 1]
+// (filter.cpp).
+struct FilterMix {
+  double w[3][3];
+};
+// False if an entry is invalid or no weight is > 0. Duplicates are merged.
+bool BuildFilterMix(const syc_weighted_filter* list, size_t count, FilterMix* out);
+// Tables and window of a mixture.
+void BuildFilterParams(const FilterMix& mix, FilterParams* out, Window* window);
 
 // Kernel launcher. Returns the launch error, if any. iterations: fixed number
 // of refinement passes (>= 0); tile 0 picks the tile size for the image; halo

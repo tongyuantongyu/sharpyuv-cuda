@@ -5,7 +5,7 @@
 // independent: no workspace, no inter-CTA synchronization, any image size (the
 // grid has one CTA per tile). With halo >= iterations the result equals the
 // global solve; a shorter halo replicates the region edge (<= 1 code at halo
-// 3, experiments/convergence/halo_e1.py).
+// 3, private/experiments/convergence/halo_e1.py).
 
 #include <cstdint>
 #include <exception>
@@ -275,7 +275,7 @@ int TileCount(const Geometry& geo, int tile, int halo) {
   return ((geo.bw + interior - 1) / interior) * ((geo.bh + interior - 1) / interior);
 }
 
-// Per-SM cost model (benchmarks/RESULTS.md "Tile size"): tiles per SM x
+// Per-SM cost model (private/benchmarks/RESULTS.md "Tile size"): tiles per SM x
 // threads per tile x per-thread cost. 32-block tiles waste less on the halo,
 // but their 1024-thread CTAs leave the SM less occupied (measured ~1.25x per
 // thread at halo 0); 16-block tiles also fill small images better.

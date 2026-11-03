@@ -296,17 +296,21 @@ typedef enum syc_channel_interpretation {
   // R, G, B, A
   SYC_INTERP_PLANAR_RGBA,
 
-  // Interleaved formats, only data[0] used.
-  // Channel in byte order, X ignores alpha.
+  // Interleaved formats, only data[0] used. Name is in byte order.
+  // 3 channel opaque formats.
   SYC_INTERP_RGB,
   SYC_INTERP_BGR,
+
+  // 4 channel formats with alpha.
   SYC_INTERP_RGBA,
-  SYC_INTERP_RGBX,
   SYC_INTERP_BGRA,
-  SYC_INTERP_BGRX,
   SYC_INTERP_ARGB,
-  SYC_INTERP_XRGB,
   SYC_INTERP_ABGR,
+
+  // 4 channel formats, ignore alpha.
+  SYC_INTERP_RGBX,
+  SYC_INTERP_BGRX,
+  SYC_INTERP_XRGB,
   SYC_INTERP_XBGR
 } syc_channel_interpretation;
 
@@ -376,9 +380,9 @@ typedef struct syc_yuv_image {
 #define SYC_ITERATIONS_AUTO (-1)
 
 /* Conversion settings, bound to one CUDA stream. Create it with
- * syc_session_create, set the fields, then call syc_session_init. Changed
- * fields take effect at the next syc_session_init, which may be called
- * between conversions without synchronizing.
+ * syc_session_create, set the fields, then call syc_session_init once. The
+ * fields must not be changed after syc_session_init; for other settings,
+ * create another session.
  *
  * Future versions may add fields: only use sessions from syc_session_create,
  * never allocate or copy the struct yourself.
@@ -390,7 +394,7 @@ typedef struct syc_session {
   // the session. Default: null, the default stream.
   cudaStream_t stream;
 
-  // Signal description. Defaults to JPEG configuration.
+  // Color description. Defaults to JPEG configuration.
   syc_color_primaries primaries;
   syc_transfer_function transfer;
   syc_matrix_coefficients matrix;
@@ -419,7 +423,8 @@ typedef struct syc_session {
 SYC_API syc_session* syc_session_create(void);
 
 // Validate the configuration and initialize the internal state for conversions.
-// The session cannot be used if any error is returned.
+// Call it once per session. The session cannot be used if any error is
+// returned; destroy it.
 SYC_NODISCARD SYC_API syc_status syc_session_init(syc_session* session);
 
 // Waits for any inflight conversions, and destroy the session.

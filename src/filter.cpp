@@ -1,61 +1,11 @@
-// FilterInfo: validated, normalized mixture of pure decoder filters.
+// Decoder filter: the weighted mixture of pure filters, and its upsampler /
+// target tables for the kernel.
 
 #include <cmath>
 
 #include "internal.hpp"
-#include "sharpyuv_cuda/sharpyuv.hpp"
 
-namespace sharpyuv {
-namespace {
-
-// Slot of a pure filter: (kind, location) with both specified, else -1.
-int Slot(DecoderFilter f) {
-  const int k = static_cast<int>(f.kind), l = static_cast<int>(f.location);
-  const int kinds = static_cast<int>(FilterKind::kBilinear);
-  const int locations = static_cast<int>(ChromaLocation::kTopLeft);
-  if (k < 1 || k > kinds || l < 1 || l > locations) return -1;
-  return (k - 1) * locations + (l - 1);
-}
-
-}  // namespace
-
-Status FilterInfo::FromFilter(DecoderFilter filter, FilterInfo* out) {
-  const WeightedFilter one{1.0, filter};
-  return FromWeighted(std::span<const WeightedFilter>(&one, 1), out);
-}
-
-Status FilterInfo::FromWeighted(std::span<const WeightedFilter> list,
-                                FilterInfo* out) {
-  if (out == nullptr) return Status::kInvalidArgument;
-  FilterInfo f;
-  double total = 0.0;
-  for (const WeightedFilter& e : list) {
-    const int slot = Slot(e.filter);
-    if (slot < 0 || !std::isfinite(e.weight) || e.weight < 0.0) {
-      return Status::kInvalidArgument;
-    }
-    f.weights_[slot] += e.weight;
-    total += e.weight;
-  }
-  if (!(total > 0.0) || !std::isfinite(total)) return Status::kInvalidArgument;
-  for (double& w : f.weights_) w /= total;
-  *out = f;
-  return Status::kOk;
-}
-
-bool FilterInfo::specified() const {
-  for (double w : weights_) {
-    if (w > 0.0) return true;
-  }
-  return false;
-}
-
-double FilterInfo::Weight(DecoderFilter filter) const {
-  const int slot = Slot(filter);
-  return slot < 0 ? 0.0 : weights_[slot];
-}
-
-namespace detail {
+namespace sharpyuv::detail {
 namespace {
 
 // Per axis a pure filter is one of three 1-D modes (filter_coeffs.py):
@@ -72,27 +22,48 @@ constexpr double kTgt1[3][3] = {{0, 0.5, 0.5}, {0, 0.5, 0.5}, {0.25, 0.5, 0.25}}
 // (vertical, horizontal) modes. Nearest ignores the location; linear is
 // vertical nearest x horizontal bilinear; location: center (C, C), left
 // (C, S), top-left (S, S).
-void Axes(FilterKind kind, ChromaLocation loc, Mode* v, Mode* h) {
-  if (kind == FilterKind::kNearest) {
+void Axes(syc_filter_kind kind, syc_chroma_location loc, Mode* v, Mode* h) {
+  if (kind == SYC_FILTER_NEAREST) {
     *v = *h = kN;
     return;
   }
-  const Mode lv = loc == ChromaLocation::kTopLeft ? kS : kC;
-  *h = loc == ChromaLocation::kCenter ? kC : kS;
-  *v = kind == FilterKind::kLinear ? kN : lv;
+  const Mode lv = loc == SYC_CHROMA_LOCATION_TOP_LEFT ? kS : kC;
+  *h = loc == SYC_CHROMA_LOCATION_CENTER ? kC : kS;
+  *v = kind == SYC_FILTER_LINEAR ? kN : lv;
+}
+
+bool ValidFilter(syc_decoder_filter f) {
+  return f.kind >= SYC_FILTER_NEAREST && f.kind <= SYC_FILTER_BILINEAR &&
+         f.location >= SYC_CHROMA_LOCATION_CENTER && f.location <= SYC_CHROMA_LOCATION_TOP_LEFT;
 }
 
 }  // namespace
 
-void BuildFilterParams(const FilterInfo& f, FilterParams* out, Window* window) {
+bool BuildFilterMix(const syc_weighted_filter* list, size_t count, FilterMix* out) {
+  FilterMix m{};
+  double total = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    const syc_weighted_filter& e = list[i];
+    if (!ValidFilter(e.filter) || !std::isfinite(e.weight) || e.weight < 0.0) return false;
+    m.w[e.filter.kind - 1][e.filter.location - 1] += e.weight;
+    total += e.weight;
+  }
+  if (!(total > 0.0) || !std::isfinite(total)) return false;
+  for (auto& row : m.w) {
+    for (double& w : row) w /= total;
+  }
+  *out = m;
+  return true;
+}
+
+void BuildFilterParams(const FilterMix& mix, FilterParams* out, Window* window) {
   double up[2][2][3][3] = {}, tgt[3][3] = {};
-  for (FilterKind k : {FilterKind::kNearest, FilterKind::kLinear, FilterKind::kBilinear}) {
-    for (ChromaLocation l :
-         {ChromaLocation::kCenter, ChromaLocation::kLeft, ChromaLocation::kTopLeft}) {
-      const double wgt = f.Weight({k, l});
+  for (int k = 0; k < 3; ++k) {
+    for (int l = 0; l < 3; ++l) {
+      const double wgt = mix.w[k][l];
       if (!(wgt > 0.0)) continue;
       Mode v, h;
-      Axes(k, l, &v, &h);
+      Axes(syc_filter_kind(k + 1), syc_chroma_location(l + 1), &v, &h);
       for (int a = 0; a < 3; ++a) {
         for (int b = 0; b < 3; ++b) {
           tgt[a][b] += wgt * kTgt1[v][a] * kTgt1[h][b];
@@ -122,6 +93,4 @@ void BuildFilterParams(const FilterInfo& f, FilterParams* out, Window* window) {
                 : Window((cols ? int32_t(Window::kCols) : 0) | (rows ? int32_t(Window::kRows) : 0));
 }
 
-}  // namespace detail
-
-}  // namespace sharpyuv
+}  // namespace sharpyuv::detail

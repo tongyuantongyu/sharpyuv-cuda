@@ -1,37 +1,77 @@
-// Session: validation, color and filter constants, launches.
+// Session (C API): defaults, validation, color and filter constants, launches.
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <new>
+#include <type_traits>
 
 #include "internal.hpp"
-#include "sharpyuv_cuda/sharpyuv.hpp"
 
-namespace sharpyuv {
+namespace sharpyuv::detail {
 namespace {
 
 // Library defaults.
-// Decoder filter for an unspecified FilterInfo: bilinear, center (libwebp).
-constexpr DecoderFilter kDefaultFilter{FilterKind::kBilinear, ChromaLocation::kCenter};
+// Signal: JPEG (BT.709 primaries, sRGB, BT.601 matrix, full range, 8-bit).
+constexpr int32_t kDefaultPrimaries = 1;
+constexpr int32_t kDefaultTransfer = 13;
+constexpr int32_t kDefaultMatrix = 6;
+constexpr syc_range kDefaultRange = SYC_RANGE_FULL;
+constexpr int32_t kDefaultBitDepth = 8;
+// Decoder filter: bilinear, center (libwebp).
+constexpr syc_decoder_filter kDefaultFilter{SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_CENTER};
 // Iterations derived from the filter: pure nearest converges in ~3 passes,
 // anything with an interpolating member needs ~6; the count depends on the
-// filter only, not on ColorInfo (experiments/convergence/RESULTS.md).
+// filter only, not on the signal (private/experiments/convergence/RESULTS.md).
 constexpr int32_t kNearestIterations = 3;
 constexpr int32_t kDefaultIterations = 6;
-// Upper bound of FilterInfo::SetIterations: the tiles are exact with a
-// halo of the iteration count, and 6 converges every filter.
+// Upper bound of syc_session::iterations: the tiles are exact with a halo of
+// the iteration count, and 6 converges every filter.
 constexpr int32_t kMaxIterations = 6;
 // Tile overlap (halo) in blocks, capped at the iteration count: 3 by default
-// (<= 1 code at tile seams, experiments/convergence/halo_e1.py), the full
-// iteration count with FilterInfo::SetExact.
+// (<= 1 code at tile seams, private/experiments/convergence/halo_e1.py), the full
+// iteration count in exact mode.
 constexpr int32_t kDefaultHaloCap = 3;
-static_assert(kDefaultIterations <= kMaxIterations && kMaxIterations <= detail::kMaxHalo);
+static_assert(kDefaultIterations <= kMaxIterations && kMaxIterations <= kMaxHalo);
 
 // HLG OOTF for the BT.2100 nominal display: gamma = 1.2 + 0.42 log10(Lw/1000).
 constexpr double kHlgNominalPeak = 1000.0;  // cd/m^2
 
-// Largest supported width / height (kImageTooLarge above).
-constexpr int kMaxDimension = 1 << 16;
+// Largest supported width / height (SYC_STATUS_IMAGE_TOO_LARGE above).
+constexpr int32_t kMaxDimension = 1 << 16;
+
+// The public struct is the base, so syc_session* and Session* convert both
+// ways; the signature rejects pointers not from syc_session_create. The
+// members are the state of syc_session_init (called once per session).
+struct Session : syc_session {
+  constexpr static uint32_t SIGN = 0xe8de022a;
+  uint32_t signature = SIGN;
+
+  bool ready = false;
+  int device = 0;
+  cudaError_t last_error = cudaSuccess;
+  ColorParams color{};  // with the filter tables and window
+  int32_t passes = 0;   // iterations, SYC_ITERATIONS_AUTO resolved
+  int32_t halo = 0;  // tile overlap: min(passes, cap), or passes if exact
+
+  static Session* FromPublic(syc_session* s) {
+    auto* session = static_cast<Session*>(s);
+    if (session->signature != SIGN) return nullptr;
+    return session;
+  }
+
+  static const Session* FromPublic(const syc_session* s) {
+    auto* session = static_cast<const Session*>(s);
+    if (session->signature != SIGN) return nullptr;
+    return session;
+  }
+
+  syc_status Fail(cudaError_t e) {
+    last_error = e;
+    return e == cudaErrorMemoryAllocation ? SYC_STATUS_OUT_OF_MEMORY : SYC_STATUS_CUDA_ERROR;
+  }
+};
 
 bool IsDefaultStream(cudaStream_t s) {
   return s == nullptr || s == cudaStreamLegacy || s == cudaStreamPerThread;
@@ -55,93 +95,46 @@ class DeviceGuard {
   bool restore_ = false;
 };
 
-size_t SampleBytes(SampleType t) {
+size_t SampleBytes(syc_sample_type t) {
   switch (t) {
-    case SampleType::kU8: return 1;
-    case SampleType::kU16:
-    case SampleType::kF16: return 2;
-    case SampleType::kF32: return 4;
+    case SYC_SAMPLE_U8: return 1;
+    case SYC_SAMPLE_U16:
+    case SYC_SAMPLE_F16: return 2;
+    case SYC_SAMPLE_F32: return 4;
   }
   return 0;
 }
 
-bool Aligned(const void* p, size_t a) {
-  return reinterpret_cast<uintptr_t>(p) % a == 0;
-}
+bool Aligned(const void* p, size_t a) { return reinterpret_cast<uintptr_t>(p) % a == 0; }
 
-}  // namespace
-
-namespace detail {
-
-KernelConfig& InternalKernelConfig() {
-  static KernelConfig config;
-  return config;
-}
-
-}  // namespace detail
-
-// ---------------------------------------------------------------------------
-
-struct Session::Impl {
-  cudaStream_t stream = nullptr;
-  int device = 0;
-  cudaError_t last_error = cudaSuccess;
-
-  // Color
-  bool has_color = false;
-  detail::ColorParams color{};
-
-  // Decoder filter (see SetFilterInfo; Create sets the library default).
-  detail::Window window = detail::Window::kBox;
-  detail::FilterParams filter{};
-  int32_t iterations = 0;
-  int32_t halo = 0;  // tile overlap: min(iterations, cap)
-
-  Status Fail(cudaError_t e) {
-    last_error = e;
-    return e == cudaErrorMemoryAllocation ? Status::kOutOfMemory
-                                          : Status::kCudaError;
+// Color constants of the session's signal description.
+syc_status BuildColorParams(const syc_session& s, ColorParams* out) {
+  const int32_t n = s.yuv_bit_depth;
+  if (n != 8 && n != 10 && n != 12 && n != 16) return SYC_STATUS_INVALID_ARGUMENT;
+  if (s.range != SYC_RANGE_LIMITED && s.range != SYC_RANGE_FULL) {
+    return SYC_STATUS_INVALID_ARGUMENT;
   }
-};
-
-Session::Session() : impl_(std::make_unique<Impl>()) {}
-
-Session::~Session() = default;
-
-Status Session::Create(const SessionConfig& config,
-                       std::unique_ptr<Session>* out) {
-  if (out == nullptr) return Status::kInvalidArgument;
-  int device = 0;
-  cudaError_t e = IsDefaultStream(config.stream)
-                      ? cudaGetDevice(&device)
-                      : cudaStreamGetDevice(config.stream, &device);
-  if (e != cudaSuccess) return Status::kInvalidArgument;
-  std::unique_ptr<Session> s(new Session());
-  s->impl_->stream = config.stream;
-  s->impl_->device = device;
-  const Status st = s->SetFilterInfo(FilterInfo{});  // the library default filter
-  if (st != Status::kOk) return st;
-  *out = std::move(s);
-  return Status::kOk;
-}
-
-cudaStream_t Session::stream() const { return impl_->stream; }
-
-cudaError_t Session::LastCudaError() const { return impl_->last_error; }
-
-Status Session::SetColorInfo(const ColorInfo& info) {
-  using detail::TfKind;
-  if (!info.primaries.specified() || !info.transfer.specified() ||
-      !info.matrix.specified() || info.range == Range::kUnspecified) {
-    return Status::kInvalidArgument;
+  const double lr = s.primaries.kr, lb = s.primaries.kb;
+  if (!ValidWeights(lr, lb)) return SYC_STATUS_INVALID_ARGUMENT;
+  double mr = 0.0, mb = 0.0;
+  switch (s.matrix.kind) {
+    case SYC_MATRIX_COEFFICIENTS:
+      mr = s.matrix.kr;
+      mb = s.matrix.kb;
+      if (!ValidWeights(mr, mb)) return SYC_STATUS_INVALID_ARGUMENT;
+      break;
+    case SYC_MATRIX_FROM_PRIMARIES:  // chroma-derived NCL (MC 12)
+      mr = lr;
+      mb = lb;
+      break;
+    default: return SYC_STATUS_INVALID_ARGUMENT;
   }
-  const int n = info.yuv_bit_depth;
-  if (n != 8 && n != 10 && n != 12 && n != 16) return Status::kInvalidArgument;
 
-  detail::ColorParams c{};
-  switch (info.transfer.kind()) {
-    case TransferFunction::Kind::kParametric: {
-      const ParametricCurve& p = info.transfer.curve();
+  ColorParams c{};
+  switch (s.transfer.kind) {
+    case SYC_TRANSFER_PARAMETRIC: {
+      const syc_parametric_curve& p = s.transfer.curve;
+      if (!ValidCurve(p)) return SYC_STATUS_INVALID_ARGUMENT;
       c.tf = TfKind::kParametric;
       c.tfp.gamma = float(p.gamma);
       c.tfp.inv_gamma = float(1.0 / p.gamma);
@@ -155,8 +148,8 @@ Status Session::SetColorInfo(const ColorInfo& info) {
       break;
     }
     // The cheaper PQ decode is accurate enough for <= 12-bit output.
-    case TransferFunction::Kind::kPq: c.tf = n <= 12 ? TfKind::kPq12 : TfKind::kPq; break;
-    case TransferFunction::Kind::kHlg: {
+    case SYC_TRANSFER_PQ: c.tf = n <= 12 ? TfKind::kPq12 : TfKind::kPq; break;
+    case SYC_TRANSFER_HLG: {
       c.tf = TfKind::kHlg;
       const double g = 1.2 + 0.42 * std::log10(kHlgNominalPeak / 1000.0);
       c.tfp.ootf_dec_exp = float(g - 1.0);
@@ -164,17 +157,12 @@ Status Session::SetColorInfo(const ColorInfo& info) {
       c.tfp.ootf_inv_gamma = float(1.0 / g);
       break;
     }
-    case TransferFunction::Kind::kLinear: c.tf = TfKind::kLinear; break;
-    default: return Status::kInvalidArgument;
+    case SYC_TRANSFER_LINEAR: c.tf = TfKind::kLinear; break;
+    default: return SYC_STATUS_INVALID_ARGUMENT;
   }
-  const double lr = info.primaries.kr(), lb = info.primaries.kb();
   c.kl[0] = float(lr);
   c.kl[1] = float(1.0 - lr - lb);
   c.kl[2] = float(lb);
-  // Chroma-derived NCL (MC 12): the matrix uses the primaries' weights.
-  const MatrixCoefficients& m = info.matrix;
-  const double mr = m.from_primaries() ? lr : m.kr();
-  const double mb = m.from_primaries() ? lb : m.kb();
   c.km[0] = float(mr);
   c.km[1] = float(1.0 - mr - mb);
   c.km[2] = float(mb);
@@ -184,7 +172,7 @@ Status Session::SetColorInfo(const ColorInfo& info) {
   c.g_from_b = float(-mb / (1.0 - mr - mb));
   c.depth = n;
   const double unit = std::ldexp(1.0, n - 8);  // 2^(n-8)
-  if (info.range == Range::kFull) {
+  if (s.range == SYC_RANGE_FULL) {
     const double maxv = std::ldexp(1.0, n) - 1.0;
     c.y_scale = float(maxv);
     c.y_offset = 0.f;
@@ -204,186 +192,251 @@ Status Session::SetColorInfo(const ColorInfo& info) {
   c.db_max = float(cb_hi / c.u_coef);
   c.dr_min = float(cb_lo / c.v_coef);
   c.dr_max = float(cb_hi / c.v_coef);
-  impl_->color = c;
-  impl_->has_color = true;
-  return Status::kOk;
+  *out = c;
+  return SYC_STATUS_OK;
 }
 
-Status Session::SetFilterInfo(const FilterInfo& filter) {
-  FilterInfo f = filter;
-  if (!f.specified()) {
-    const Status st = FilterInfo::FromFilter(kDefaultFilter, &f);
-    if (st != Status::kOk) return st;
+// Input layout of an interpretation: samples per pixel, R, G, B, A offsets
+// (interleaved), planar, alpha. False for an unknown interpretation.
+struct Layout {
+  int32_t stride, r, g, b, a;
+  bool planar, alpha;
+};
+
+bool GetLayout(syc_channel_interpretation i, Layout* out) {
+  switch (i) {
+    case SYC_INTERP_PLANAR_RGB: *out = {1, 0, 0, 0, 0, true, false}; return true;
+    case SYC_INTERP_PLANAR_RGBA: *out = {1, 0, 0, 0, 0, true, true}; return true;
+    case SYC_INTERP_RGB: *out = {3, 0, 1, 2, 0, false, false}; return true;
+    case SYC_INTERP_BGR: *out = {3, 2, 1, 0, 0, false, false}; return true;
+    case SYC_INTERP_RGBA: *out = {4, 0, 1, 2, 3, false, true}; return true;
+    case SYC_INTERP_BGRA: *out = {4, 2, 1, 0, 3, false, true}; return true;
+    case SYC_INTERP_ARGB: *out = {4, 1, 2, 3, 0, false, true}; return true;
+    case SYC_INTERP_ABGR: *out = {4, 3, 2, 1, 0, false, true}; return true;
+    case SYC_INTERP_RGBX: *out = {4, 0, 1, 2, 3, false, false}; return true;
+    case SYC_INTERP_BGRX: *out = {4, 2, 1, 0, 3, false, false}; return true;
+    case SYC_INTERP_XRGB: *out = {4, 1, 2, 3, 0, false, false}; return true;
+    case SYC_INTERP_XBGR: *out = {4, 3, 2, 1, 0, false, false}; return true;
   }
-  const bool nearest_only =
-      f.Weight({FilterKind::kNearest, ChromaLocation::kCenter}) +
-          f.Weight({FilterKind::kNearest, ChromaLocation::kLeft}) +
-          f.Weight({FilterKind::kNearest, ChromaLocation::kTopLeft}) >=
-      1.0 - 1e-12;
-  if (filter.iterations() > kMaxIterations) return Status::kInvalidArgument;
-  const int32_t iterations =
-      filter.iterations() >= 0
-          ? filter.iterations()
-          : (nearest_only ? kNearestIterations : kDefaultIterations);
-  detail::BuildFilterParams(f, &impl_->filter, &impl_->window);
-  impl_->iterations = iterations;
-  // Block-local filters (pure nearest) need no overlap: exact at halo 0.
-  impl_->halo = impl_->window == detail::Window::kLocal ? 0
-                : filter.exact()                      ? iterations
-                                                      : std::min(iterations, kDefaultHaloCap);
-  return Status::kOk;
+  return false;
 }
 
-Status Session::Convert(const RgbImage& src, const YuvImage& dst) {
-  Impl& s = *impl_;
-  if (!s.has_color) return Status::kNotReady;
-  const int w = src.width, h = src.height;
-  if (w < 1 || h < 1 || dst.width != w || dst.height != h) {
-    return Status::kInvalidArgument;
-  }
-  if (w > kMaxDimension || h > kMaxDimension) return Status::kImageTooLarge;
-
-  const int bw = (w + 1) / 2, bh = (h + 1) / 2;
-
-  // Input
-  detail::InputDesc in{};
+syc_status BuildInput(const syc_rgb_image& src, InputDesc* out) {
+  InputDesc in{};
+  const int32_t w = src.width;
   const size_t sb = SampleBytes(src.type);
-  if (sb == 0) return Status::kInvalidArgument;
   switch (src.type) {
-    case SampleType::kU8:
-      in.type = detail::InType::kU8;
+    case SYC_SAMPLE_U8:
+      in.type = InType::kU8;
       in.scale = 1.f / 255.f;
       break;
-    case SampleType::kU16: {
-      const int bits = src.u16_bits == 0 ? 16 : src.u16_bits;
-      if (bits < 1 || bits > 16) return Status::kInvalidArgument;
-      in.type = detail::InType::kU16;
-      in.scale = float(1.0 / (std::ldexp(1.0, bits) - 1.0));
+    case SYC_SAMPLE_U16:
+      if (src.u16_bits < 1 || src.u16_bits > 16) return SYC_STATUS_INVALID_ARGUMENT;
+      in.type = InType::kU16;
+      in.scale = float(1.0 / (std::ldexp(1.0, src.u16_bits) - 1.0));
+      break;
+    case SYC_SAMPLE_F16:
+    case SYC_SAMPLE_F32: {
+      const double lo = src.float_min, hi = src.float_max;
+      if (!std::isfinite(lo) || !std::isfinite(hi) || lo == hi) {
+        return SYC_STATUS_INVALID_ARGUMENT;
+      }
+      in.type = src.type == SYC_SAMPLE_F16 ? InType::kF16 : InType::kF32;
+      in.scale = float(1.0 / (hi - lo));
+      in.offset = float(-lo / (hi - lo));
       break;
     }
-    case SampleType::kF16:
-    case SampleType::kF32:
-      if (!std::isfinite(src.float_scale) || !std::isfinite(src.float_offset)) {
-        return Status::kInvalidArgument;
-      }
-      in.type = src.type == SampleType::kF16 ? detail::InType::kF16
-                                             : detail::InType::kF32;
-      in.scale = src.float_scale;
-      in.offset = src.float_offset;
-      break;
+    default: return SYC_STATUS_INVALID_ARGUMENT;
   }
-  in.linear = src.encoding == InputEncoding::kLinear;
-  switch (src.alpha) {
-    case AlphaSource::kNone: break;
-    case AlphaSource::kInterleaved: {
-      const ChannelOrder o = src.order;
-      if (src.planar || (o != ChannelOrder::kRGBA && o != ChannelOrder::kBGRA &&
-                         o != ChannelOrder::kARGB && o != ChannelOrder::kABGR)) {
-        return Status::kInvalidArgument;
-      }
-      break;
+  switch (src.encoding) {
+    case SYC_INPUT_ENCODED: break;
+    case SYC_INPUT_LINEAR: in.linear = 1; break;
+    default: return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  Layout l;
+  if (!GetLayout(src.interpretation, &l)) return SYC_STATUS_INVALID_ARGUMENT;
+  in.planar = l.planar;
+  in.alpha = l.alpha;
+  const int planes = l.planar ? (l.alpha ? 4 : 3) : 1;
+  for (int c = 0; c < planes; ++c) {
+    if (src.data[c] == nullptr || !Aligned(src.data[c], sb) || src.pitch[c] % sb != 0 ||
+        src.pitch[c] < size_t(w) * l.stride * sb) {
+      return SYC_STATUS_INVALID_ARGUMENT;
     }
-    case AlphaSource::kPlane:
-      // Planar colour only: alpha comes with 4-channel interleaved input or
-      // as the fourth plane of planar input.
-      if (!src.planar || src.alpha_data == nullptr || !Aligned(src.alpha_data, sb) ||
-          src.alpha_pitch % sb != 0 || src.alpha_pitch < size_t(w) * sb) {
-        return Status::kInvalidArgument;
-      }
-      in.ptr[3] = static_cast<const unsigned char*>(src.alpha_data);
-      in.pitch[3] = src.alpha_pitch;
-      break;
-    default: return Status::kInvalidArgument;
+    in.ptr[c] = static_cast<const unsigned char*>(src.data[c]);
+    in.pitch[c] = src.pitch[c];
   }
-  const bool alpha = src.alpha != AlphaSource::kNone;
-  in.alpha = alpha;
-  in.planar = src.planar;
-  if (src.planar) {
-    for (int c = 0; c < 3; ++c) {
-      if (src.data[c] == nullptr || !Aligned(src.data[c], sb) ||
-          src.pitch[c] % sb != 0 || src.pitch[c] < size_t(w) * sb) {
-        return Status::kInvalidArgument;
-      }
-      in.ptr[c] = static_cast<const unsigned char*>(src.data[c]);
-      in.pitch[c] = src.pitch[c];
-    }
-  } else {
-    int stride = 3, r = 0, g = 1, b = 2, a = 3;
-    switch (src.order) {
-      case ChannelOrder::kRGB: break;
-      case ChannelOrder::kBGR: r = 2, b = 0; break;
-      case ChannelOrder::kRGBA: stride = 4; break;
-      case ChannelOrder::kBGRA: stride = 4, r = 2, b = 0; break;
-      case ChannelOrder::kARGB: stride = 4, r = 1, g = 2, b = 3, a = 0; break;
-      case ChannelOrder::kABGR: stride = 4, r = 3, g = 2, b = 1, a = 0; break;
-      default: return Status::kInvalidArgument;
-    }
-    if (src.data[0] == nullptr || !Aligned(src.data[0], sb) ||
-        src.pitch[0] % sb != 0 || src.pitch[0] < size_t(w) * stride * sb) {
-      return Status::kInvalidArgument;
-    }
-    in.ptr[0] = static_cast<const unsigned char*>(src.data[0]);
-    in.pitch[0] = src.pitch[0];
-    in.stride = stride;
-    in.off[0] = r;
-    in.off[1] = g;
-    in.off[2] = b;
-    in.off[3] = a;
-  }
-
-  // Output
-  detail::OutputDesc out{};
-  const size_t ob = s.color.depth == 8 ? 1 : 2;
-  auto plane_ok = [&](const void* p, size_t pitch, size_t row_samples) {
-    return p != nullptr && Aligned(p, ob) && pitch % ob == 0 &&
-           pitch >= row_samples * ob;
-  };
-  const size_t cw = size_t(bw);
-  if (!plane_ok(dst.data[0], dst.pitch[0], size_t(w))) {
-    return Status::kInvalidArgument;
-  }
-  out.y = static_cast<unsigned char*>(dst.data[0]);
-  out.y_pitch = dst.pitch[0];
-  out.biplanar = dst.biplanar;
-  out.swap_uv = dst.swap_uv;
-  if (dst.biplanar) {
-    if (!plane_ok(dst.data[1], dst.pitch[1], 2 * cw)) return Status::kInvalidArgument;
-    out.u = static_cast<unsigned char*>(dst.data[1]);
-    out.u_pitch = dst.pitch[1];
-  } else {
-    if (!plane_ok(dst.data[1], dst.pitch[1], cw) ||
-        !plane_ok(dst.data[2], dst.pitch[2], cw)) {
-      return Status::kInvalidArgument;
-    }
-    out.u = static_cast<unsigned char*>(dst.data[1]);
-    out.u_pitch = dst.pitch[1];
-    out.v = static_cast<unsigned char*>(dst.data[2]);
-    out.v_pitch = dst.pitch[2];
-  }
-  out.shift = (s.color.depth > 8 && dst.alignment == SampleAlignment::kMsb)
-                  ? 16 - s.color.depth
-                  : 0;
-  if (dst.alpha_data != nullptr &&
-      (!alpha || !plane_ok(dst.alpha_data, dst.alpha_pitch, size_t(w)))) {
-    return Status::kInvalidArgument;  // alpha output needs alpha processing
-  }
-  out.a = static_cast<unsigned char*>(dst.alpha_data);
-  out.a_pitch = dst.alpha_pitch;
-
-  const detail::Geometry geo{w, h, bw, bh};
-  detail::ColorParams cp = s.color;
-  cp.window = s.window;
-  cp.filter = s.filter;
-  DeviceGuard guard(s.device);
-  const detail::KernelConfig& kc = detail::InternalKernelConfig();
-  const int32_t halo = kc.halo < 0 ? s.halo : kc.halo;
-  if ((cp.tf == detail::TfKind::kPq || cp.tf == detail::TfKind::kPq12) && kc.pq_fast >= 0) {
-    cp.tf = kc.pq_fast ? detail::TfKind::kPq12 : detail::TfKind::kPq;
-  }
-  const cudaError_t e =
-      detail::LaunchConvert(cp, in, out, geo, s.iterations, kc.tile, halo, s.stream);
-  if (e != cudaSuccess) return s.Fail(e);
-  return Status::kOk;
+  in.stride = l.stride;
+  in.off[0] = l.r;
+  in.off[1] = l.g;
+  in.off[2] = l.b;
+  in.off[3] = l.a;
+  *out = in;
+  return SYC_STATUS_OK;
 }
 
-}  // namespace sharpyuv
+syc_status BuildOutput(const syc_yuv_image& dst, int32_t depth, bool alpha, OutputDesc* out) {
+  const size_t ob = depth == 8 ? 1 : 2;
+  const size_t w = size_t(dst.width), cw = size_t((dst.width + 1) / 2);
+  auto plane_ok = [&](const void* p, size_t pitch, size_t row_samples) {
+    return p != nullptr && Aligned(p, ob) && pitch % ob == 0 && pitch >= row_samples * ob;
+  };
+  if (dst.alignment != SYC_ALIGN_LSB && dst.alignment != SYC_ALIGN_MSB) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  OutputDesc o{};
+  if (!plane_ok(dst.data[0], dst.pitch[0], w)) return SYC_STATUS_INVALID_ARGUMENT;
+  o.y = static_cast<unsigned char*>(dst.data[0]);
+  o.y_pitch = dst.pitch[0];
+  o.biplanar = dst.biplanar;
+  o.swap_uv = dst.swap_uv;
+  if (dst.biplanar) {
+    if (!plane_ok(dst.data[1], dst.pitch[1], 2 * cw)) return SYC_STATUS_INVALID_ARGUMENT;
+  } else if (!plane_ok(dst.data[1], dst.pitch[1], cw) ||
+             !plane_ok(dst.data[2], dst.pitch[2], cw)) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  o.u = static_cast<unsigned char*>(dst.data[1]);
+  o.u_pitch = dst.pitch[1];
+  if (!dst.biplanar) {
+    o.v = static_cast<unsigned char*>(dst.data[2]);
+    o.v_pitch = dst.pitch[2];
+  }
+  o.shift = (depth > 8 && dst.alignment == SYC_ALIGN_MSB) ? 16 - depth : 0;
+  // Alpha output: needs alpha input.
+  if (dst.data[3] != nullptr && (!alpha || !plane_ok(dst.data[3], dst.pitch[3], w))) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  o.a = static_cast<unsigned char*>(dst.data[3]);
+  o.a_pitch = dst.pitch[3];
+  *out = o;
+  return SYC_STATUS_OK;
+}
+
+}  // namespace
+
+KernelConfig& InternalKernelConfig() {
+  static KernelConfig config;
+  return config;
+}
+
+}  // namespace sharpyuv::detail
+
+using namespace sharpyuv::detail;
+
+extern "C" {
+
+syc_session* syc_session_create(void) {
+  auto* s = new (std::nothrow) Session();
+  if (s == nullptr) return nullptr;
+  s->stream = nullptr;
+  if (syc_primaries_from_h273(kDefaultPrimaries, &s->primaries) != SYC_STATUS_OK ||
+      syc_transfer_from_h273(kDefaultTransfer, &s->transfer) != SYC_STATUS_OK ||
+      syc_matrix_from_h273(kDefaultMatrix, &s->matrix) != SYC_STATUS_OK) {
+    delete s;
+    return nullptr;
+  }
+  s->range = kDefaultRange;
+  s->yuv_bit_depth = kDefaultBitDepth;
+  s->filter = kDefaultFilter;
+  s->weighted_filters = nullptr;
+  s->num_weighted_filters = 0;
+  s->iterations = SYC_ITERATIONS_AUTO;
+  s->exact = false;
+  return s;
+}
+
+syc_status syc_session_init(syc_session* session) {
+  if (session == nullptr) return SYC_STATUS_INVALID_ARGUMENT;
+  auto* s = Session::FromPublic(session);
+  if (s == nullptr) return SYC_STATUS_INVALID_ARGUMENT;
+  
+  s->ready = false;
+
+  int device = 0;
+  const cudaError_t e = IsDefaultStream(s->stream) ? cudaGetDevice(&device)
+                                                  : cudaStreamGetDevice(s->stream, &device);
+  if (e != cudaSuccess) return SYC_STATUS_INVALID_ARGUMENT;
+
+  auto& color = s->color;
+  const syc_status st = BuildColorParams(*s, &color);
+  if (st != SYC_STATUS_OK) return st;
+
+  FilterMix mix{};
+  const syc_weighted_filter single{1.0, s->filter};
+  const bool list = s->num_weighted_filters > 0;
+  if (list && s->weighted_filters == nullptr) return SYC_STATUS_INVALID_ARGUMENT;
+  if (!BuildFilterMix(list ? s->weighted_filters : &single, list ? s->num_weighted_filters : 1,
+                      &mix)) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  if (s->iterations < SYC_ITERATIONS_AUTO || s->iterations > kMaxIterations) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  const bool nearest_only = mix.w[0][0] + mix.w[0][1] + mix.w[0][2] >= 1.0 - 1e-12;
+  const int32_t iterations = s->iterations >= 0 ? s->iterations
+                             : nearest_only    ? kNearestIterations
+                                               : kDefaultIterations;
+  BuildFilterParams(mix, &color.filter, &color.window);
+
+  s->passes = iterations;
+  // Block-local filters (pure nearest) need no overlap: exact at halo 0.
+  s->halo = color.window == Window::kLocal ? 0
+           : s->exact                  ? iterations
+                                      : std::min(iterations, kDefaultHaloCap);
+  s->device = device;
+  s->ready = true;
+  return SYC_STATUS_OK;
+}
+
+void syc_session_destroy(syc_session* session) {
+  if (session == nullptr) return;
+  auto* s = Session::FromPublic(session);
+  if (s == nullptr) return;
+  if (s->ready) {
+    DeviceGuard guard(s->device);
+    cudaStreamSynchronize(s->stream);
+  }
+  delete s;
+}
+
+syc_status syc_session_convert(syc_session* session, const syc_rgb_image* src,
+                               const syc_yuv_image* dst) {
+  if (session == nullptr || src == nullptr || dst == nullptr) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
+  auto* s = Session::FromPublic(session);
+  if (s == nullptr) return SYC_STATUS_INVALID_ARGUMENT;
+  if (!s->ready) return SYC_STATUS_NOT_READY;
+  const int32_t w = src->width, h = src->height;
+  if (w < 1 || h < 1 || dst->width != w || dst->height != h) return SYC_STATUS_INVALID_ARGUMENT;
+  if (w > kMaxDimension || h > kMaxDimension) return SYC_STATUS_IMAGE_TOO_LARGE;
+
+  InputDesc in{};
+  syc_status st = BuildInput(*src, &in);
+  if (st != SYC_STATUS_OK) return st;
+  OutputDesc out{};
+  st = BuildOutput(*dst, s->color.depth, in.alpha != 0, &out);
+  if (st != SYC_STATUS_OK) return st;
+
+  const Geometry geo{w, h, (w + 1) / 2, (h + 1) / 2};
+  ColorParams cp = s->color;
+  DeviceGuard guard(s->device);
+  const KernelConfig& kc = InternalKernelConfig();
+  const int32_t halo = kc.halo < 0 ? s->halo : kc.halo;
+  if ((cp.tf == TfKind::kPq || cp.tf == TfKind::kPq12) && kc.pq_fast >= 0) {
+    cp.tf = kc.pq_fast ? TfKind::kPq12 : TfKind::kPq;
+  }
+  const cudaError_t e = LaunchConvert(cp, in, out, geo, s->passes, kc.tile, halo, s->stream);
+  if (e != cudaSuccess) return s->Fail(e);
+  return SYC_STATUS_OK;
+}
+
+int32_t syc_session_last_cuda_error(const syc_session* session) {
+  if (session == nullptr) return 0;
+  auto* s = Session::FromPublic(session);
+  if (s == nullptr) return 0;
+  return int32_t(s->last_error);
+}
+
+}  // extern "C"

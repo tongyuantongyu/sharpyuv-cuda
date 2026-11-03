@@ -1,5 +1,6 @@
-// sharpyuv-cuda tests: factories, exactness on uniform images, format
-// equivalence, and sharp-YUV quality on synthetic edges (host-side decoder).
+// sharpyuv-cuda tests: factories, session validation, exactness on uniform
+// images, format equivalence, and sharp-YUV quality on synthetic edges
+// (host-side decoder).
 
 #include <cuda_runtime_api.h>
 
@@ -10,7 +11,9 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,13 +36,34 @@ std::string g_context;
     }                                                                        \
   } while (0)
 
-#define CHECK_OK(expr)                                                       \
+#define CHECK_STATUS(expr, want)                                             \
   do {                                                                       \
-    const Status s_ = (expr);                                                \
-    if (s_ != Status::kOk) {                                                 \
+    const syc_status s_ = (expr);                                            \
+    if (s_ != (want)) {                                                      \
       ++g_failures;                                                          \
-      std::printf("FAIL %s:%d [%s] %s -> %s\n", __FILE__, __LINE__,          \
-                  g_context.c_str(), #expr, ToString(s_));                   \
+      std::printf("FAIL %s:%d [%s] %s -> %s (want %s)\n", __FILE__, __LINE__, \
+                  g_context.c_str(), #expr, syc_status_string(s_),           \
+                  syc_status_string(want));                                  \
+    }                                                                        \
+  } while (0)
+
+#define CHECK_OK(expr) CHECK_STATUS(expr, SYC_STATUS_OK)
+
+// expr throws sharpyuv::Error with the given status (SYC_STATUS_OK: does not
+// throw).
+#define CHECK_THROWS(expr, want)                                             \
+  do {                                                                       \
+    syc_status s_ = SYC_STATUS_OK;                                           \
+    try {                                                                    \
+      (void)(expr);                                                          \
+    } catch (const Error& e_) {                                              \
+      s_ = e_.status();                                                      \
+    }                                                                        \
+    if (s_ != (want)) {                                                      \
+      ++g_failures;                                                          \
+      std::printf("FAIL %s:%d [%s] %s threw %s (want %s)\n", __FILE__,       \
+                  __LINE__, g_context.c_str(), #expr, syc_status_string(s_), \
+                  syc_status_string(want));                                  \
     }                                                                        \
   } while (0)
 
@@ -77,6 +101,37 @@ struct DeviceBuffer {
 };
 
 // ---------------------------------------------------------------------------
+// Images
+
+RgbImage Interleaved(const void* data, size_t pitch, int w, int h, syc_sample_type type,
+                     syc_channel_interpretation interp = SYC_INTERP_RGB) {
+  RgbImage img;
+  img.width = w;
+  img.height = h;
+  img.type = type;
+  img.interpretation = interp;
+  img.data[0] = data;
+  img.pitch[0] = pitch;
+  return img;
+}
+
+// Planar R, G, B, and A if a is not null; one pitch for all planes.
+RgbImage Planar(const void* r, const void* g, const void* b, size_t pitch, int w, int h,
+                syc_sample_type type, const void* a = nullptr) {
+  RgbImage img;
+  img.width = w;
+  img.height = h;
+  img.type = type;
+  img.interpretation = a ? SYC_INTERP_PLANAR_RGBA : SYC_INTERP_PLANAR_RGB;
+  const void* planes[4] = {r, g, b, a};
+  for (int c = 0; c < 4; ++c) {
+    img.data[c] = planes[c];
+    img.pitch[c] = planes[c] ? pitch : 0;
+  }
+  return img;
+}
+
+// ---------------------------------------------------------------------------
 // Host reference color math (double)
 
 struct Rgb {
@@ -92,55 +147,55 @@ bool Quick() {
 struct Setup {
   const char* name;
   int cp, tc, mc;
-  Range range;
+  syc_range range;
   int depth;
-  ChromaLocation loc;
+  syc_chroma_location loc;
 };
 
-ColorInfo MakeColorInfo(const Setup& s) {
-  ColorInfo ci;
-  CHECK_OK(ColorPrimaries::FromH273(s.cp, &ci.primaries));
-  CHECK_OK(TransferFunction::FromH273(s.tc, &ci.transfer));
-  CHECK_OK(MatrixCoefficients::FromH273(s.mc, &ci.matrix));
-  ci.range = s.range;
-  ci.yuv_bit_depth = s.depth;
-  return ci;
+// An initialized session for a setup: the given filter list, or bilinear at
+// the setup's location; iterations SYC_ITERATIONS_AUTO: the filter's
+// default. A failed Init is reported, and the session's conversions then
+// fail with SYC_STATUS_NOT_READY.
+Session MakeSession(cudaStream_t stream, const Setup& setup,
+                    std::span<const syc_weighted_filter> filters = {},
+                    int32_t iterations = SYC_ITERATIONS_AUTO, bool exact = false) {
+  Session s;
+  try {
+    s.SetStream(stream)
+        .SetColor(ColorPrimaries::FromH273(setup.cp), TransferFunction::FromH273(setup.tc),
+                  MatrixCoefficients::FromH273(setup.mc), setup.range, setup.depth)
+        .SetEffort(iterations, exact);
+    if (filters.empty()) {
+      s.SetFilters(syc_decoder_filter{SYC_FILTER_BILINEAR, setup.loc});
+    } else {
+      s.SetFilters(filters);
+    }
+    s.Init();
+  } catch (const Error& e) {
+    ++g_failures;
+    std::printf("FAIL [%s] MakeSession: %s\n", g_context.c_str(), e.what());
+  }
+  return s;
 }
 
-// Bilinear decoder filter at the given chroma location; iterations < 0: the
-// filter's default.
-FilterInfo MakeFilter(ChromaLocation loc, int32_t iterations = -1) {
-  FilterInfo f;
-  CHECK_OK(FilterInfo::FromFilter({FilterKind::kBilinear, loc}, &f));
-  f.SetIterations(iterations);
-  return f;
-}
+using FilterList = std::vector<syc_weighted_filter>;
 
 // Decoder filters covering every kernel window: the setup's bilinear
 // location (kBox / kCols), top-left (kFull), linear left (kCols), nearest
 // (kLocal), and blends (kBox, kFull).
-std::vector<std::pair<std::string, FilterInfo>> TestFilters(ChromaLocation loc) {
-  using K = FilterKind;
-  using L = ChromaLocation;
-  const std::vector<std::pair<std::string, std::vector<WeightedFilter>>> lists = {
-      {"bilinear", {{1, {K::kBilinear, loc}}}},
-      {"top-left", {{1, {K::kBilinear, L::kTopLeft}}}},
-      {"linear left", {{1, {K::kLinear, L::kLeft}}}},
-      {"nearest", {{1, {K::kNearest, L::kCenter}}}},
-      {"center+nearest", {{1, {K::kBilinear, L::kCenter}}, {1, {K::kNearest, L::kCenter}}}},
-      {"c+tl+lin+nn",
-       {{1, {K::kBilinear, L::kCenter}},
-        {1, {K::kBilinear, L::kTopLeft}},
-        {1, {K::kLinear, L::kLeft}},
-        {1, {K::kNearest, L::kCenter}}}},
+std::vector<std::pair<std::string, FilterList>> TestFilters(syc_chroma_location loc) {
+  constexpr syc_decoder_filter kCenter{SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_CENTER};
+  constexpr syc_decoder_filter kTopLeft{SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_TOP_LEFT};
+  constexpr syc_decoder_filter kLinearLeft{SYC_FILTER_LINEAR, SYC_CHROMA_LOCATION_LEFT};
+  constexpr syc_decoder_filter kNearest{SYC_FILTER_NEAREST, SYC_CHROMA_LOCATION_CENTER};
+  return {
+      {"bilinear", {{1, {SYC_FILTER_BILINEAR, loc}}}},
+      {"top-left", {{1, kTopLeft}}},
+      {"linear left", {{1, kLinearLeft}}},
+      {"nearest", {{1, kNearest}}},
+      {"center+nearest", {{1, kCenter}, {1, kNearest}}},
+      {"c+tl+lin+nn", {{1, kCenter}, {1, kTopLeft}, {1, kLinearLeft}, {1, kNearest}}},
   };
-  std::vector<std::pair<std::string, FilterInfo>> out;
-  for (const auto& [name, list] : lists) {
-    FilterInfo f;
-    CHECK_OK(FilterInfo::FromWeighted(list, &f));
-    out.emplace_back(name, f);
-  }
-  return out;
 }
 
 struct Quant {
@@ -148,9 +203,9 @@ struct Quant {
   int maxv;
 };
 
-Quant MakeQuant(Range range, int n) {
+Quant MakeQuant(syc_range range, int n) {
   const double unit = std::ldexp(1.0, n - 8);
-  if (range == Range::kFull) {
+  if (range == SYC_RANGE_FULL) {
     const double m = std::ldexp(1.0, n) - 1;
     return {m, 0, m, std::ldexp(1.0, n - 1), int(m)};
   }
@@ -158,16 +213,18 @@ Quant MakeQuant(Range range, int n) {
 }
 
 // Standard (non-sharp) Y'CbCr of an encoded RGB' triple, quantized.
-void ReferenceYuv(Rgb p, const ColorInfo& ci, int* y, int* cb, int* cr) {
-  const bool derived = ci.matrix.from_primaries();  // MC 12
-  const double kr = derived ? ci.primaries.kr() : ci.matrix.kr();
-  const double kb = derived ? ci.primaries.kb() : ci.matrix.kb(), kg = 1 - kr - kb;
+void ReferenceYuv(Rgb p, const Setup& s, int* y, int* cb, int* cr) {
+  const ColorPrimaries prim = ColorPrimaries::FromH273(s.cp);
+  const MatrixCoefficients m = MatrixCoefficients::FromH273(s.mc);
+  const bool derived = m.kind == SYC_MATRIX_FROM_PRIMARIES;  // MC 12
+  const double kr = derived ? prim.kr : m.kr;
+  const double kb = derived ? prim.kb : m.kb, kg = 1 - kr - kb;
   const double yy = kr * p.r + kg * p.g + kb * p.b;
   const double u = (p.b - yy) / (2 * (1 - kb));
   const double v = (p.r - yy) / (2 * (1 - kr));
-  const Quant q = MakeQuant(ci.range, ci.yuv_bit_depth);
-  auto quant = [&](double x, double s, double o) {
-    return std::clamp(int(std::lround(x * s + o)), 0, q.maxv);
+  const Quant q = MakeQuant(s.range, s.depth);
+  auto quant = [&](double x, double sc, double o) {
+    return std::clamp(int(std::lround(x * sc + o)), 0, q.maxv);
   };
   *y = quant(yy, q.y_scale, q.y_offset);
   *cb = quant(u, q.c_scale, q.c_offset);
@@ -190,12 +247,21 @@ struct YuvBuffers {
         c_pitch((size_t((w_ + 1) / 2) * (biplanar_ ? 2 : 1) + 7) * bytes),
         y(y_pitch * h_), u(c_pitch * ((h_ + 1) / 2)), v(c_pitch * ((h_ + 1) / 2)) {}
 
-  YuvImage Image(SampleAlignment a = SampleAlignment::kLsb, bool swap = false) {
-    YuvImage img = biplanar ? YuvImage::Biplanar(y.ptr, y_pitch, u.ptr, c_pitch, w, h, a)
-                            : YuvImage::Planar(y.ptr, y_pitch, u.ptr, c_pitch, v.ptr,
-                                               c_pitch, w, h);
-    img.alignment = a;
+  YuvImage Image(syc_sample_alignment a = SYC_ALIGN_LSB, bool swap = false) {
+    YuvImage img;
+    img.width = w;
+    img.height = h;
+    img.biplanar = biplanar;
     img.swap_uv = swap;
+    img.alignment = a;
+    img.data[0] = y.ptr;
+    img.pitch[0] = y_pitch;
+    img.data[1] = u.ptr;
+    img.pitch[1] = c_pitch;
+    if (!biplanar) {
+      img.data[2] = v.ptr;
+      img.pitch[2] = c_pitch;
+    }
     return img;
   }
 
@@ -237,188 +303,236 @@ struct YuvBuffers {
   }
 };
 
-std::unique_ptr<Session> MakeSession(cudaStream_t stream) {
-  std::unique_ptr<Session> s;
-  CHECK_OK(Session::Create({.stream = stream}, &s));
-  return s;
+// All planes of a conversion, concatenated.
+std::vector<int> Convert(Session& s, const RgbImage& src, int depth) {
+  YuvBuffers out(src.width, src.height, depth, false);
+  CHECK_OK(s.Convert(src, out.Image()));
+  std::vector<int> Y, Cb, Cr;
+  out.Read(&Y, &Cb, &Cr);
+  Y.insert(Y.end(), Cb.begin(), Cb.end());
+  Y.insert(Y.end(), Cr.begin(), Cr.end());
+  return Y;
 }
+
+const Setup kSetups[] = {
+    {"sRGB/709 full 8 center", 1, 13, 1, SYC_RANGE_FULL, 8, SYC_CHROMA_LOCATION_CENTER},
+    {"709/601 limited 8 left", 1, 1, 6, SYC_RANGE_LIMITED, 8, SYC_CHROMA_LOCATION_LEFT},
+    {"PQ 2020 limited 10 left", 9, 16, 9, SYC_RANGE_LIMITED, 10, SYC_CHROMA_LOCATION_LEFT},
+    {"HLG 2020 limited 10 left", 9, 18, 9, SYC_RANGE_LIMITED, 10, SYC_CHROMA_LOCATION_LEFT},
+    {"P3 sRGB/601 full 12", 12, 13, 6, SYC_RANGE_FULL, 12, SYC_CHROMA_LOCATION_CENTER},
+    {"linear 709 full 16", 1, 8, 1, SYC_RANGE_FULL, 16, SYC_CHROMA_LOCATION_CENTER},
+    {"2.2 709 limited 16", 1, 4, 1, SYC_RANGE_LIMITED, 16, SYC_CHROMA_LOCATION_LEFT},
+    {"P3 sRGB/chroma-derived full 8", 12, 13, 12, SYC_RANGE_FULL, 8, SYC_CHROMA_LOCATION_CENTER},
+};
 
 // ---------------------------------------------------------------------------
 // Tests
 
 void TestFactories() {
   g_context = "factories";
-  ColorPrimaries p;
-  CHECK(!p.specified());
-  CHECK_OK(ColorPrimaries::FromH273(1, &p));
-  CHECK(std::fabs(p.kr() - 0.2126) < 2e-4 && std::fabs(p.kb() - 0.0722) < 2e-4);
-  CHECK_OK(ColorPrimaries::FromH273(9, &p));
-  CHECK(std::fabs(p.kr() - 0.2627) < 2e-4 && std::fabs(p.kb() - 0.0593) < 2e-4);
-  CHECK_OK(ColorPrimaries::FromH273(12, &p));
-  CHECK(std::fabs(p.kr() - 0.2290) < 2e-4 && std::fabs(p.kb() - 0.0793) < 2e-4);
-  CHECK(ColorPrimaries::FromH273(2, &p) == Status::kUnsupported);
-  CHECK(ColorPrimaries::FromLumaCoefficients(0.7, 0.4, &p) == Status::kInvalidArgument);
-
-  TransferFunction t;
-  CHECK(!t.specified());
-  for (int code : {1, 4, 5, 6, 7, 8, 13, 14, 15, 16, 18}) {
-    CHECK_OK(TransferFunction::FromH273(code, &t));
+  CHECK(syc_version() == SYC_VERSION);
+  for (int s = SYC_STATUS_OK; s <= SYC_STATUS_CUDA_ERROR; ++s) {
+    CHECK(syc_status_string(syc_status(s)) != nullptr);
   }
-  CHECK(TransferFunction::FromH273(2, &t) == Status::kUnsupported);
-  CHECK(TransferFunction::FromParametric({2.4, 1.055, 0.0031308, 10.0}, &t) ==
-        Status::kInvalidArgument);  // discontinuous
-  CHECK_OK(TransferFunction::FromParametric({2.4, 1.0, 0.0, 0.0}, &t));
 
-  MatrixCoefficients m;
-  CHECK(!m.specified());
-  CHECK(MatrixCoefficients::FromH273(0, &m) == Status::kUnsupported);
-  CHECK(MatrixCoefficients::FromH273(10, &m) == Status::kUnsupported);
-  CHECK_OK(MatrixCoefficients::FromH273(9, &m));
-  CHECK(!m.from_primaries());
-  CHECK(MatrixCoefficients::FromH273(13, &m) == Status::kUnsupported);  // chroma-derived CL
-  CHECK_OK(MatrixCoefficients::FromH273(12, &m));
-  CHECK(m.specified() && m.from_primaries());
-  CHECK_OK(MatrixCoefficients::FromCoefficients(0.2126, 0.0722, &m));
-  CHECK(!m.from_primaries());
+  const ColorPrimaries p709 = ColorPrimaries::FromH273(1);
+  CHECK(std::fabs(p709.kr - 0.2126) < 2e-4 && std::fabs(p709.kb - 0.0722) < 2e-4);
+  const ColorPrimaries p2020 = ColorPrimaries::FromH273(9);
+  CHECK(std::fabs(p2020.kr - 0.2627) < 2e-4 && std::fabs(p2020.kb - 0.0593) < 2e-4);
+  const ColorPrimaries p3 = ColorPrimaries::FromH273(12);
+  CHECK(std::fabs(p3.kr - 0.2290) < 2e-4 && std::fabs(p3.kb - 0.0793) < 2e-4);
+  CHECK_THROWS(ColorPrimaries::FromH273(2), SYC_STATUS_UNSUPPORTED);
+  CHECK_THROWS(ColorPrimaries::FromLumaCoefficients(0.7, 0.4), SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_THROWS(ColorPrimaries::FromChromaticities({0.64, 0.33}, {0.64, 0.33}, {0.15, 0.06},
+                                                  {0.3127, 0.329}),
+               SYC_STATUS_INVALID_ARGUMENT);  // degenerate
+  CHECK_STATUS(syc_primaries_from_h273(1, nullptr), SYC_STATUS_INVALID_ARGUMENT);
 
-  FilterInfo f;
-  CHECK(!f.specified() && f.iterations() < 0);
-  CHECK(FilterInfo::FromFilter({FilterKind::kBilinear, ChromaLocation::kUnspecified}, &f) ==
-        Status::kInvalidArgument);
-  CHECK(FilterInfo::FromFilter({FilterKind::kNearest, ChromaLocation::kUnspecified}, &f) ==
-        Status::kInvalidArgument);  // location required for every kind
-  CHECK(FilterInfo::FromFilter({FilterKind::kUnspecified, ChromaLocation::kCenter}, &f) ==
-        Status::kInvalidArgument);
-  CHECK_OK(FilterInfo::FromFilter({FilterKind::kLinear, ChromaLocation::kLeft}, &f));
-  CHECK(f.specified() && f.Weight({FilterKind::kLinear, ChromaLocation::kLeft}) == 1.0);
-  const WeightedFilter blend[] = {{1, {FilterKind::kBilinear, ChromaLocation::kCenter}},
-                                  {2, {FilterKind::kNearest, ChromaLocation::kCenter}},
-                                  {1, {FilterKind::kBilinear, ChromaLocation::kCenter}}};
-  CHECK_OK(FilterInfo::FromWeighted(blend, &f));  // duplicates merged, normalized
-  CHECK(std::fabs(f.Weight({FilterKind::kBilinear, ChromaLocation::kCenter}) - 0.5) < 1e-12);
-  CHECK(std::fabs(f.Weight({FilterKind::kNearest, ChromaLocation::kCenter}) - 0.5) < 1e-12);
-  CHECK(f.Weight({FilterKind::kBilinear, ChromaLocation::kLeft}) == 0.0);
-  const WeightedFilter negative[] = {{-1, {FilterKind::kBilinear, ChromaLocation::kCenter}}};
-  CHECK(FilterInfo::FromWeighted(negative, &f) == Status::kInvalidArgument);
-  const WeightedFilter zero[] = {{0, {FilterKind::kBilinear, ChromaLocation::kCenter}}};
-  CHECK(FilterInfo::FromWeighted(zero, &f) == Status::kInvalidArgument);
-  CHECK(FilterInfo::FromWeighted({}, &f) == Status::kInvalidArgument);
-  f.SetIterations(1000);
-  CHECK(f.iterations() == 1000);
-  CHECK(!FilterInfo{}.exact());
-  f.SetExact(true);
-  CHECK(f.exact());
+  for (int code : {1, 4, 5, 6, 7, 8, 13, 14, 15, 16, 18}) {
+    CHECK_THROWS(TransferFunction::FromH273(code), SYC_STATUS_OK);
+  }
+  CHECK(TransferFunction::FromH273(16).kind == SYC_TRANSFER_PQ);
+  CHECK_THROWS(TransferFunction::FromH273(2), SYC_STATUS_UNSUPPORTED);
+  CHECK_THROWS(TransferFunction::FromParametric({2.4, 1.055, 0.0031308, 10.0}),
+               SYC_STATUS_INVALID_ARGUMENT);  // discontinuous
+  CHECK_THROWS(TransferFunction::FromParametric({2.4, 1.0, 0.0, 0.0}), SYC_STATUS_OK);
+
+  CHECK_THROWS(MatrixCoefficients::FromH273(0), SYC_STATUS_UNSUPPORTED);
+  CHECK_THROWS(MatrixCoefficients::FromH273(10), SYC_STATUS_UNSUPPORTED);
+  CHECK_THROWS(MatrixCoefficients::FromH273(13), SYC_STATUS_UNSUPPORTED);  // chroma-derived CL
+  CHECK(MatrixCoefficients::FromH273(9).kind == SYC_MATRIX_COEFFICIENTS);
+  CHECK(MatrixCoefficients::FromH273(12).kind == SYC_MATRIX_FROM_PRIMARIES);
+  CHECK(MatrixCoefficients::FromCoefficients(0.2126, 0.0722).kind == SYC_MATRIX_COEFFICIENTS);
+  CHECK_THROWS(MatrixCoefficients::FromCoefficients(0.0, 0.1), SYC_STATUS_INVALID_ARGUMENT);
 }
 
-void TestSessionErrors(cudaStream_t stream) {
-  g_context = "session errors";
-  std::unique_ptr<Session> s;
-  CHECK_OK(Session::Create({.stream = stream}, &s));
-  YuvBuffers out(8, 8, 8, false);
-  std::vector<uint8_t> px(8 * 8 * 3, 0);
-  DeviceBuffer in(px);
-  const RgbImage src = RgbImage::Interleaved(in.ptr, 24, 8, 8, SampleType::kU8);
-  CHECK(s->Convert(src, out.Image()) == Status::kNotReady);
-  CHECK(s->SetColorInfo(ColorInfo{}) == Status::kInvalidArgument);
+// The C session: defaults, and syc_session_init validation (one fresh
+// session per case: init is called once per session).
+void TestSessionInit(cudaStream_t stream) {
+  g_context = "session init";
+  syc_session_destroy(nullptr);  // no-op
+  CHECK_STATUS(syc_session_init(nullptr), SYC_STATUS_INVALID_ARGUMENT);
 
-  CHECK_OK(s->SetColorInfo(MakeColorInfo(
-      {"", 1, 13, 1, Range::kFull, 8, ChromaLocation::kCenter})));
-  CHECK_OK(s->Convert(src, out.Image()));
+  syc_session* d = syc_session_create();
+  CHECK(d != nullptr);
+  CHECK(d->stream == nullptr && d->range == SYC_RANGE_FULL && d->yuv_bit_depth == 8);
+  CHECK(std::fabs(d->primaries.kr - 0.2126) < 2e-4);
+  CHECK(d->transfer.kind == SYC_TRANSFER_PARAMETRIC && d->transfer.curve.gamma == 2.4);
+  CHECK(d->matrix.kind == SYC_MATRIX_COEFFICIENTS && d->matrix.kr == 0.299);
+  CHECK(d->filter.kind == SYC_FILTER_BILINEAR &&
+        d->filter.location == SYC_CHROMA_LOCATION_CENTER);
+  CHECK(d->weighted_filters == nullptr && d->num_weighted_filters == 0);
+  CHECK(d->iterations == SYC_ITERATIONS_AUTO && !d->exact);
+  CHECK(syc_session_last_cuda_error(d) == 0);
+  syc_session_destroy(d);
+
+  auto init = [&](const std::function<void(syc_session*)>& change) {
+    syc_session* s = syc_session_create();
+    s->stream = stream;
+    change(s);
+    const syc_status st = syc_session_init(s);
+    syc_session_destroy(s);
+    return st;
+  };
+  const syc_weighted_filter zero[] = {{0, {SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_CENTER}}};
+  const syc_weighted_filter negative[] = {
+      {-1, {SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_CENTER}}};
+  const syc_weighted_filter no_location[] = {
+      {1, {SYC_FILTER_NEAREST, SYC_CHROMA_LOCATION_UNSPECIFIED}}};
+  CHECK_OK(init([](syc_session*) {}));
+  CHECK_OK(init([](syc_session* s) { s->iterations = 0; }));
+  CHECK_OK(init([](syc_session* s) { s->iterations = 6; }));
+  CHECK_STATUS(init([](syc_session* s) { s->iterations = 7; }), SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->iterations = -2; }), SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->yuv_bit_depth = 9; }), SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->range = SYC_RANGE_UNSPECIFIED; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->primaries = {0, 0}; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->transfer.kind = SYC_TRANSFER_UNSPECIFIED; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->transfer.curve.gamma = 0.5; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->matrix.kind = SYC_MATRIX_UNSPECIFIED; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->filter.kind = SYC_FILTER_UNSPECIFIED; }),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(init([](syc_session* s) { s->num_weighted_filters = 1; }),  // null list
+               SYC_STATUS_INVALID_ARGUMENT);
+  for (const syc_weighted_filter* list : {zero, negative, no_location}) {
+    CHECK_STATUS(init([&](syc_session* s) {
+                   s->weighted_filters = list;
+                   s->num_weighted_filters = 1;
+                 }),
+                 SYC_STATUS_INVALID_ARGUMENT);
+  }
+
+  // A failed init leaves the session unusable.
+  syc_session* bad = syc_session_create();
+  bad->iterations = 7;
+  CHECK_STATUS(syc_session_init(bad), SYC_STATUS_INVALID_ARGUMENT);
+  std::vector<uint8_t> px(4 * 4 * 3, 0);
+  DeviceBuffer in(px);
+  YuvBuffers out(4, 4, 8, false);
+  const RgbImage src = Interleaved(in.ptr, 12, 4, 4, SYC_SAMPLE_U8);
+  const YuvImage dst = out.Image();
+  CHECK_STATUS(syc_session_convert(bad, &src, &dst), SYC_STATUS_NOT_READY);
+  syc_session_destroy(bad);
+
+  // C++: Init throws.
+  Session t;
+  t.SetEffort(7, false);
+  CHECK_THROWS(t.Init(), SYC_STATUS_INVALID_ARGUMENT);
+}
+
+void TestConvertErrors(cudaStream_t stream) {
+  g_context = "convert errors";
+  YuvBuffers out(8, 8, 8, false);
+  std::vector<uint8_t> px(8 * 8 * 4, 0);
+  DeviceBuffer in(px);
+  const RgbImage src = Interleaved(in.ptr, 24, 8, 8, SYC_SAMPLE_U8);
+  {
+    Session s;
+    s.SetStream(stream);
+    CHECK_STATUS(s.Convert(src, out.Image()), SYC_STATUS_NOT_READY);  // before Init
+  }
+  Session s = MakeSession(stream, kSetups[0]);
+  CHECK_OK(s.Convert(src, out.Image()));
+  CHECK_STATUS(syc_session_convert(nullptr, &src, nullptr), SYC_STATUS_INVALID_ARGUMENT);
+  YuvBuffers out7(7, 8, 8, false);
+  CHECK_STATUS(s.Convert(src, out7.Image()), SYC_STATUS_INVALID_ARGUMENT);  // size mismatch
   // Above the supported size (checked before any pointer is used).
   const int huge = (1 << 16) + 1;
-  const RgbImage huge_src = RgbImage::Interleaved(in.ptr, size_t(huge) * 3, huge, 1,
-                                                  SampleType::kU8);
-  const YuvImage huge_dst = YuvImage::Planar(out.y.ptr, huge, out.u.ptr, huge, out.v.ptr,
-                                             huge, huge, 1);
-  CHECK(s->Convert(huge_src, huge_dst) == Status::kImageTooLarge);
+  const RgbImage huge_src = Interleaved(in.ptr, size_t(huge) * 3, huge, 1, SYC_SAMPLE_U8);
+  YuvImage huge_dst = out.Image();
+  huge_dst.width = huge;
+  huge_dst.height = 1;
+  CHECK_STATUS(s.Convert(huge_src, huge_dst), SYC_STATUS_IMAGE_TOO_LARGE);
 
-  // Generic filters: blends and every kind / location.
-  FilterInfo f;
-  const WeightedFilter blend[] = {{1, {FilterKind::kBilinear, ChromaLocation::kCenter}},
-                                  {1, {FilterKind::kNearest, ChromaLocation::kCenter}}};
-  CHECK_OK(FilterInfo::FromWeighted(blend, &f));
-  CHECK_OK(s->SetFilterInfo(f));
-  CHECK_OK(FilterInfo::FromFilter({FilterKind::kBilinear, ChromaLocation::kTopLeft}, &f));
-  CHECK_OK(s->SetFilterInfo(f));
-  CHECK_OK(s->SetFilterInfo(FilterInfo{}));  // unspecified: library default
-  f = FilterInfo{};
-  f.SetIterations(7);  // above the maximum of 6
-  CHECK(s->SetFilterInfo(f) == Status::kInvalidArgument);
-  f.SetIterations(6);
-  CHECK_OK(s->SetFilterInfo(f));
+  RgbImage bad = src;
+  bad.pitch[0] = 23;  // < a row
+  CHECK_STATUS(s.Convert(bad, out.Image()), SYC_STATUS_INVALID_ARGUMENT);
+  bad = src;
+  bad.interpretation = syc_channel_interpretation(99);
+  CHECK_STATUS(s.Convert(bad, out.Image()), SYC_STATUS_INVALID_ARGUMENT);
+  bad = Interleaved(in.ptr, 48, 8, 8, SYC_SAMPLE_U16);
+  bad.u16_bits = 0;
+  CHECK_STATUS(s.Convert(bad, out.Image()), SYC_STATUS_INVALID_ARGUMENT);
+  bad = Interleaved(in.ptr, 96, 8, 1, SYC_SAMPLE_F32);
+  bad.float_max = bad.float_min;
+  YuvBuffers out1(8, 1, 8, false);
+  CHECK_STATUS(s.Convert(bad, out1.Image()), SYC_STATUS_INVALID_ARGUMENT);
+  YuvImage bad_dst = out.Image();
+  bad_dst.alignment = syc_sample_alignment(5);
+  CHECK_STATUS(s.Convert(src, bad_dst), SYC_STATUS_INVALID_ARGUMENT);
 
   // Alpha: 4-channel interleaved, or planar with an A plane.
   YuvBuffers small(4, 4, 8, false);
   const unsigned char* p = static_cast<const unsigned char*>(in.ptr);
-  RgbImage rgba = RgbImage::Interleaved(p, 16, 4, 4, SampleType::kU8, ChannelOrder::kRGBA);
-  rgba.alpha = AlphaSource::kInterleaved;
-  CHECK_OK(s->Convert(rgba, small.Image()));
-  RgbImage planar = RgbImage::Planar(p, p + 16, p + 32, 4, 4, 4, SampleType::kU8);
-  planar.alpha = AlphaSource::kPlane;
-  planar.alpha_data = p + 48;
-  planar.alpha_pitch = 4;
-  CHECK_OK(s->Convert(planar, small.Image()));
+  const RgbImage rgba = Interleaved(p, 16, 4, 4, SYC_SAMPLE_U8, SYC_INTERP_RGBA);
+  CHECK_OK(s.Convert(rgba, small.Image()));
+  const RgbImage planar = Planar(p, p + 16, p + 32, 4, 4, 4, SYC_SAMPLE_U8, p + 48);
+  CHECK_OK(s.Convert(planar, small.Image()));
   RgbImage bad_alpha = planar;
-  bad_alpha.alpha_pitch = 3;  // < width
-  CHECK(s->Convert(bad_alpha, small.Image()) == Status::kInvalidArgument);
+  bad_alpha.pitch[3] = 3;  // < width
+  CHECK_STATUS(s.Convert(bad_alpha, small.Image()), SYC_STATUS_INVALID_ARGUMENT);
   bad_alpha = planar;
-  bad_alpha.alpha_data = nullptr;
-  CHECK(s->Convert(bad_alpha, small.Image()) == Status::kInvalidArgument);
-  // Interleaved RGB with a separate A plane is not a supported layout.
-  RgbImage rgb_plane = RgbImage::Interleaved(p, 24, 4, 4, SampleType::kU8);
-  rgb_plane.alpha = AlphaSource::kPlane;
-  rgb_plane.alpha_data = p;
-  rgb_plane.alpha_pitch = 8;
-  CHECK(s->Convert(rgb_plane, small.Image()) == Status::kInvalidArgument);
-  RgbImage rgb_order = RgbImage::Interleaved(p, 24, 4, 4, SampleType::kU8);
-  rgb_order.alpha = AlphaSource::kInterleaved;  // RGB order has no A channel
-  CHECK(s->Convert(rgb_order, small.Image()) == Status::kInvalidArgument);
+  bad_alpha.data[3] = nullptr;
+  CHECK_STATUS(s.Convert(bad_alpha, small.Image()), SYC_STATUS_INVALID_ARGUMENT);
+  // Alpha output: needs alpha input.
   YuvImage alpha_out = small.Image();
-  alpha_out.alpha_data = alpha_out.data[0];
-  alpha_out.alpha_pitch = alpha_out.pitch[0];
-  // Alpha output without alpha processing.
-  CHECK(s->Convert(RgbImage::Interleaved(p, 24, 4, 4, SampleType::kU8), alpha_out) ==
-        Status::kInvalidArgument);
-  CHECK_OK(s->Convert(rgba, alpha_out));
+  alpha_out.data[3] = alpha_out.data[0];
+  alpha_out.pitch[3] = alpha_out.pitch[0];
+  CHECK_STATUS(s.Convert(Interleaved(p, 12, 4, 4, SYC_SAMPLE_U8), alpha_out),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_STATUS(s.Convert(Interleaved(p, 16, 4, 4, SYC_SAMPLE_U8, SYC_INTERP_RGBX), alpha_out),
+               SYC_STATUS_INVALID_ARGUMENT);
+  CHECK_OK(s.Convert(rgba, alpha_out));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 }
-
-const Setup kSetups[] = {
-    {"sRGB/709 full 8 center", 1, 13, 1, Range::kFull, 8, ChromaLocation::kCenter},
-    {"709/601 limited 8 left", 1, 1, 6, Range::kLimited, 8, ChromaLocation::kLeft},
-    {"PQ 2020 limited 10 left", 9, 16, 9, Range::kLimited, 10, ChromaLocation::kLeft},
-    {"HLG 2020 limited 10 left", 9, 18, 9, Range::kLimited, 10, ChromaLocation::kLeft},
-    {"P3 sRGB/601 full 12", 12, 13, 6, Range::kFull, 12, ChromaLocation::kCenter},
-    {"linear 709 full 16", 1, 8, 1, Range::kFull, 16, ChromaLocation::kCenter},
-    {"2.2 709 limited 16", 1, 4, 1, Range::kLimited, 16, ChromaLocation::kLeft},
-    {"P3 sRGB/chroma-derived full 8", 12, 13, 12, Range::kFull, 8, ChromaLocation::kCenter},
-};
 
 // A uniform image must give exactly the standard conversion (the sharp
 // iteration has nothing to correct).
 void TestUniform(cudaStream_t stream) {
   const int w = 37, h = 21;
-  auto session = MakeSession(stream);
   const Rgb colors[] = {{0, 0, 0},       {1, 1, 1},       {0.5, 0.5, 0.5},
                         {1, 0, 0},       {0, 1, 0},       {0, 0, 1},
                         {0.9, 0.2, 0.6}, {0.1, 0.8, 0.75}};
   for (const Setup& setup : kSetups) {
-    const ColorInfo ci = MakeColorInfo(setup);
-    CHECK_OK(session->SetColorInfo(ci));
-    CHECK_OK(session->SetFilterInfo(MakeFilter(setup.loc)));
+    g_context = std::string("uniform ") + setup.name;
+    Session session = MakeSession(stream, setup);
     for (const Rgb& c : colors) {
-      for (SampleType type : {SampleType::kU8, SampleType::kU16, SampleType::kF32}) {
-        g_context = std::string("uniform ") + setup.name;
+      for (syc_sample_type type : {SYC_SAMPLE_U8, SYC_SAMPLE_U16, SYC_SAMPLE_F32}) {
         // Quantize the color to the input type; expected = from that value.
         Rgb q = c;
         std::vector<unsigned char> raw;
         size_t sb = 1;
-        if (type == SampleType::kU8) {
+        if (type == SYC_SAMPLE_U8) {
           q = {std::round(c.r * 255) / 255, std::round(c.g * 255) / 255,
                std::round(c.b * 255) / 255};
           for (int i = 0; i < w * h; ++i)
             for (double v : {q.r, q.g, q.b}) raw.push_back(uint8_t(std::lround(v * 255)));
-        } else if (type == SampleType::kU16) {
+        } else if (type == SYC_SAMPLE_U16) {
           sb = 2;
           q = {std::round(c.r * 65535) / 65535, std::round(c.g * 65535) / 65535,
                std::round(c.b * 65535) / 65535};
@@ -439,13 +553,12 @@ void TestUniform(cudaStream_t stream) {
         }
         DeviceBuffer in(raw);
         YuvBuffers out(w, h, setup.depth, false);
-        const RgbImage src =
-            RgbImage::Interleaved(in.ptr, size_t(w) * 3 * sb, w, h, type);
-        CHECK_OK(session->Convert(src, out.Image()));
+        const RgbImage src = Interleaved(in.ptr, size_t(w) * 3 * sb, w, h, type);
+        CHECK_OK(session.Convert(src, out.Image()));
         std::vector<int> Y, Cb, Cr;
         out.Read(&Y, &Cb, &Cr);
         int ey, ecb, ecr;
-        ReferenceYuv(q, ci, &ey, &ecb, &ecr);
+        ReferenceYuv(q, setup, &ey, &ecb, &ecr);
         int worst = 0;
         for (int v : Y) worst = std::max(worst, std::abs(v - ey));
         for (int v : Cb) worst = std::max(worst, std::abs(v - ecb));
@@ -532,13 +645,12 @@ std::vector<float> RgbaImage(int w, int h) {
 // tile sizes, whose seams fall in different places. Exact mode, and the
 // default whenever the halo cap (3) covers the iteration count, must be
 // bit-identical; the default at 4..6 iterations is an approximation,
-// bounded here on a worst-case synthetic image. (experiments/algo/
+// bounded here on a worst-case synthetic image. (private/experiments/algo/
 // check_cuda.py compares exact mode with the independent Python solve.)
 void TestTiles(cudaStream_t stream) {
   using detail::KernelConfig;
   KernelConfig& kc = detail::InternalKernelConfig();
   const KernelConfig saved = kc;
-  auto session = MakeSession(stream);
   struct Approx {
     int worst = 0, runs = 0;
     double differing = 0;
@@ -555,61 +667,52 @@ void TestTiles(cudaStream_t stream) {
   const std::vector<int> iteration_counts =
       Quick() ? std::vector<int>{3, 6} : std::vector<int>{0, 1, 3, 4, 6};
   for (const Setup& setup : setups) {
-    CHECK_OK(session->SetColorInfo(MakeColorInfo(setup)));
     for (auto [w, h] : sizes) {
       const std::vector<Rgb> img = EdgeImage(w, h);
       std::vector<float> f;
       for (const Rgb& c : img) f.insert(f.end(), {float(c.r), float(c.g), float(c.b)});
       DeviceBuffer in(f), in_rgba(RgbaImage(w, h));
-      RgbImage rgba = RgbImage::Interleaved(in_rgba.ptr, size_t(w) * 16, w, h, SampleType::kF32,
-                                            ChannelOrder::kRGBA);
-      rgba.alpha = AlphaSource::kInterleaved;
+      const RgbImage rgba =
+          Interleaved(in_rgba.ptr, size_t(w) * 16, w, h, SYC_SAMPLE_F32, SYC_INTERP_RGBA);
+      const RgbImage rgb = Interleaved(in.ptr, size_t(w) * 12, w, h, SYC_SAMPLE_F32);
       for (bool alpha : {false, true}) {
-      const RgbImage src =
-          alpha ? rgba : RgbImage::Interleaved(in.ptr, size_t(w) * 12, w, h, SampleType::kF32);
-      for (const auto& [filter_name_, filter] : TestFilters(setup.loc)) {
-      const std::string filter_name = filter_name_ + (alpha ? " +alpha" : "");
-      for (int iters : iteration_counts) {
-        auto run = [&](KernelConfig c, bool exact, std::vector<int>* all) {
-          FilterInfo fi = filter;
-          fi.SetIterations(iters);
-          fi.SetExact(exact);
-          CHECK_OK(session->SetFilterInfo(fi));
-          kc = c;
-          YuvBuffers out(w, h, setup.depth, false);
-          CHECK_OK(session->Convert(src, out.Image()));
-          std::vector<int> Y, Cb, Cr;
-          out.Read(&Y, &Cb, &Cr);
-          all->assign(Y.begin(), Y.end());
-          all->insert(all->end(), Cb.begin(), Cb.end());
-          all->insert(all->end(), Cr.begin(), Cr.end());
-        };
-        std::vector<int> ref, got;
-        const bool one_tile = (w + 1) / 2 <= 32 && (h + 1) / 2 <= 32;
-        run(one_tile ? KernelConfig{32, 0} : KernelConfig{32}, !one_tile, &ref);
-        g_context = std::string("tiles ") + setup.name + " " + filter_name + " " +
-                    std::to_string(w) + "x" + std::to_string(h) + " iters " +
-                    std::to_string(iters);
-        for (int tile : {0, 16, 32}) {
-          run({tile}, true, &got);
-          CHECK(got == ref);  // exact: halo = iterations
-          run({tile}, false, &got);
-          if (iters <= 3 || filter_name_ == "nearest") {
-            CHECK(got == ref);  // the halo covers every iteration (nearest: none needed)
-          } else {
-            Approx& a = approx[filter_name];
-            size_t n = 0;
-            for (size_t i = 0; i < ref.size(); ++i) {
-              const int d = std::abs(got[i] - ref[i]);
-              a.worst = std::max(a.worst, d);
-              n += d != 0;
+        const RgbImage& src = alpha ? rgba : rgb;
+        for (const auto& [filter_name_, filters] : TestFilters(setup.loc)) {
+          const std::string filter_name = filter_name_ + (alpha ? " +alpha" : "");
+          for (int iters : iteration_counts) {
+            g_context = std::string("tiles ") + setup.name + " " + filter_name + " " +
+                        std::to_string(w) + "x" + std::to_string(h) + " iters " +
+                        std::to_string(iters);
+            Session exact = MakeSession(stream, setup, filters, iters, true);
+            Session fast = MakeSession(stream, setup, filters, iters, false);
+            auto run = [&](KernelConfig c, Session& s) {
+              kc = c;
+              std::vector<int> all = Convert(s, src, setup.depth);
+              kc = saved;
+              return all;
+            };
+            const bool one_tile = (w + 1) / 2 <= 32 && (h + 1) / 2 <= 32;
+            const std::vector<int> ref =
+                one_tile ? run(KernelConfig{32, 0}, fast) : run(KernelConfig{32}, exact);
+            for (int tile : {0, 16, 32}) {
+              CHECK(run({tile}, exact) == ref);  // exact: halo = iterations
+              const std::vector<int> got = run({tile}, fast);
+              if (iters <= 3 || filter_name_ == "nearest") {
+                CHECK(got == ref);  // the halo covers every iteration (nearest: none needed)
+              } else {
+                Approx& a = approx[filter_name];
+                size_t n = 0;
+                for (size_t i = 0; i < ref.size(); ++i) {
+                  const int d = std::abs(got[i] - ref[i]);
+                  a.worst = std::max(a.worst, d);
+                  n += d != 0;
+                }
+                a.differing += double(n) / double(ref.size());
+                ++a.runs;
+              }
             }
-            a.differing += double(n) / double(ref.size());
-            ++a.runs;
           }
         }
-      }
-      }
       }
     }
   }
@@ -627,7 +730,7 @@ void TestTiles(cudaStream_t stream) {
 // Mean |encoded luminance error| of the decoded image, in 8-bit codes.
 double DecodeLuminanceError(const std::vector<Rgb>& src, int w, int h,
                             const std::vector<int>& Y, const std::vector<int>& Cb,
-                            const std::vector<int>& Cr, ChromaLocation loc) {
+                            const std::vector<int>& Cr, syc_chroma_location loc) {
   const double kr = 0.2126, kb = 0.0722, kg = 1 - kr - kb;  // BT.709 full
   const int cw = (w + 1) / 2, ch = (h + 1) / 2;
   auto chroma = [&](const std::vector<int>& p, int x, int y) {
@@ -639,7 +742,7 @@ double DecodeLuminanceError(const std::vector<Rgb>& src, int w, int h,
     const int by = py / 2, byn = (py % 2 == 0) ? by - 1 : by + 1;
     auto v = [&](int bx) { return 0.75 * chroma(p, bx, by) + 0.25 * chroma(p, bx, byn); };
     const int bx = px / 2;
-    if (loc == ChromaLocation::kCenter) {
+    if (loc == SYC_CHROMA_LOCATION_CENTER) {
       return 0.75 * v(bx) + 0.25 * v(px % 2 == 0 ? bx - 1 : bx + 1);
     }
     return px % 2 == 0 ? v(bx) : 0.5 * (v(bx) + v(bx + 1));
@@ -672,33 +775,23 @@ void TestSharpQuality(cudaStream_t stream) {
   std::vector<float> f;
   for (const Rgb& c : img) f.insert(f.end(), {float(c.r), float(c.g), float(c.b)});
   DeviceBuffer in(f);
-  const RgbImage src = RgbImage::Interleaved(in.ptr, size_t(w) * 12, w, h, SampleType::kF32);
-  auto session = MakeSession(stream);
-  for (ChromaLocation loc : {ChromaLocation::kCenter, ChromaLocation::kLeft}) {
-    g_context = loc == ChromaLocation::kCenter ? "quality center" : "quality left";
-    CHECK_OK(session->SetColorInfo(MakeColorInfo({"", 1, 13, 1, Range::kFull, 8, loc})));
-    CHECK_OK(session->SetFilterInfo(MakeFilter(loc)));
-    double err[3];
-    const int iters[3] = {0, 1, 4};
-    for (int k = 0; k < 3; ++k) {
+  const RgbImage src = Interleaved(in.ptr, size_t(w) * 12, w, h, SYC_SAMPLE_F32);
+  for (syc_chroma_location loc : {SYC_CHROMA_LOCATION_CENTER, SYC_CHROMA_LOCATION_LEFT}) {
+    g_context = loc == SYC_CHROMA_LOCATION_CENTER ? "quality center" : "quality left";
+    const Setup setup{"", 1, 13, 1, SYC_RANGE_FULL, 8, loc};
+    auto error = [&](int iters) {
+      Session s = MakeSession(stream, setup, {}, iters);
       YuvBuffers out(w, h, 8, false);
-      CHECK_OK(session->SetFilterInfo(MakeFilter(loc, iters[k])));
-      CHECK_OK(session->Convert(src, out.Image()));
+      CHECK_OK(s.Convert(src, out.Image()));
       std::vector<int> Y, Cb, Cr;
       out.Read(&Y, &Cb, &Cr);
-      err[k] = DecodeLuminanceError(img, w, h, Y, Cb, Cr, loc);
-    }
+      return DecodeLuminanceError(img, w, h, Y, Cb, Cr, loc);
+    };
+    const double err[3] = {error(0), error(1), error(4)};
     std::printf("  %s: mean luminance error (8-bit codes) iters 0/1/4: %.2f / %.2f / %.2f\n",
                 g_context.c_str(), err[0], err[1], err[2]);
     if (std::getenv("SHARPYUV_TRACE")) {
-      for (int it = 0; it <= 6; ++it) {
-        YuvBuffers out(w, h, 8, false);
-        CHECK_OK(session->SetFilterInfo(MakeFilter(loc, it)));
-        CHECK_OK(session->Convert(src, out.Image()));
-        std::vector<int> Y, Cb, Cr;
-        out.Read(&Y, &Cb, &Cr);
-        std::printf("    iter %2d: %.3f\n", it, DecodeLuminanceError(img, w, h, Y, Cb, Cr, loc));
-      }
+      for (int it = 0; it <= 6; ++it) std::printf("    iter %2d: %.3f\n", it, error(it));
     }
     // Measured: center 19.3 / 3.3 / 1.6, left 19.7 / 3.5 / 2.0.
     CHECK(err[1] < 0.25 * err[0]);
@@ -712,19 +805,20 @@ void TestFormats(cudaStream_t stream) {
   g_context = "formats";
   const int w = 33, h = 19;
   const std::vector<Rgb> img = EdgeImage(w, h);
-  auto session = MakeSession(stream);
 
   struct Variant {
     const char* name;
     std::function<RgbImage(std::vector<std::unique_ptr<DeviceBuffer>>&)> make;
   };
-  std::vector<uint8_t> rgb8, bgra8, planes8[3];
-  std::vector<float> planes32[3];
+  std::vector<uint8_t> rgb8, bgrx8, xrgb8, planes8[3];
+  std::vector<uint16_t> rgb10;
+  std::vector<float> planes32[3], rgb255;
   for (const Rgb& c : img) {
     const uint8_t r = uint8_t(std::lround(c.r * 255)), g = uint8_t(std::lround(c.g * 255)),
                   b = uint8_t(std::lround(c.b * 255));
     rgb8.insert(rgb8.end(), {r, g, b});
-    bgra8.insert(bgra8.end(), {b, g, r, 255});
+    bgrx8.insert(bgrx8.end(), {b, g, r, 7});  // X is ignored
+    xrgb8.insert(xrgb8.end(), {0, r, g, b});
     planes8[0].push_back(r), planes8[1].push_back(g), planes8[2].push_back(b);
     // Exactly the U8 path's mapping (v * (1 / 255.f)): r / 255.f can differ
     // by one ulp, which may flip a code at a rounding boundary.
@@ -734,30 +828,32 @@ void TestFormats(cudaStream_t stream) {
   std::vector<Variant> variants = {
       {"rgb8", [&](auto& keep) {
          keep.push_back(std::make_unique<DeviceBuffer>(rgb8));
-         return RgbImage::Interleaved(keep.back()->ptr, size_t(w) * 3, w, h, SampleType::kU8);
+         return Interleaved(keep.back()->ptr, size_t(w) * 3, w, h, SYC_SAMPLE_U8);
        }},
-      {"bgra8", [&](auto& keep) {
-         keep.push_back(std::make_unique<DeviceBuffer>(bgra8));
-         return RgbImage::Interleaved(keep.back()->ptr, size_t(w) * 4, w, h, SampleType::kU8,
-                                      ChannelOrder::kBGRA);
+      {"bgrx8", [&](auto& keep) {
+         keep.push_back(std::make_unique<DeviceBuffer>(bgrx8));
+         return Interleaved(keep.back()->ptr, size_t(w) * 4, w, h, SYC_SAMPLE_U8, SYC_INTERP_BGRX);
+       }},
+      {"xrgb8", [&](auto& keep) {
+         keep.push_back(std::make_unique<DeviceBuffer>(xrgb8));
+         return Interleaved(keep.back()->ptr, size_t(w) * 4, w, h, SYC_SAMPLE_U8, SYC_INTERP_XRGB);
        }},
       {"planar8", [&](auto& keep) {
          for (auto& p : planes8) keep.push_back(std::make_unique<DeviceBuffer>(p));
          const size_t n = keep.size();
-         return RgbImage::Planar(keep[n - 3]->ptr, keep[n - 2]->ptr, keep[n - 1]->ptr,
-                                 size_t(w), w, h, SampleType::kU8);
+         return Planar(keep[n - 3]->ptr, keep[n - 2]->ptr, keep[n - 1]->ptr, size_t(w), w, h,
+                       SYC_SAMPLE_U8);
        }},
       {"planar32", [&](auto& keep) {
          for (auto& p : planes32) keep.push_back(std::make_unique<DeviceBuffer>(p));
          const size_t n = keep.size();
-         return RgbImage::Planar(keep[n - 3]->ptr, keep[n - 2]->ptr, keep[n - 1]->ptr,
-                                 size_t(w) * 4, w, h, SampleType::kF32);
+         return Planar(keep[n - 3]->ptr, keep[n - 2]->ptr, keep[n - 1]->ptr, size_t(w) * 4, w,
+                       h, SYC_SAMPLE_F32);
        }},
   };
 
   for (const Setup& setup : {kSetups[0], kSetups[2]}) {
-    CHECK_OK(session->SetColorInfo(MakeColorInfo(setup)));
-    CHECK_OK(session->SetFilterInfo(MakeFilter(setup.loc)));
+    Session session = MakeSession(stream, setup);
     std::vector<int> refY, refCb, refCr;
     bool first = true;
     for (Variant& v : variants) {
@@ -765,7 +861,7 @@ void TestFormats(cudaStream_t stream) {
       std::vector<std::unique_ptr<DeviceBuffer>> keep;
       const RgbImage src = v.make(keep);
       YuvBuffers out(w, h, setup.depth, false);
-      CHECK_OK(session->Convert(src, out.Image()));
+      CHECK_OK(session.Convert(src, out.Image()));
       std::vector<int> Y, Cb, Cr;
       out.Read(&Y, &Cb, &Cr);
       if (first) {
@@ -780,8 +876,8 @@ void TestFormats(cudaStream_t stream) {
     for (bool swap : {false, true}) {
       g_context = std::string("formats ") + setup.name + (swap ? " biplanar swap" : " biplanar");
       YuvBuffers out(w, h, setup.depth, true);
-      const auto align = setup.depth > 8 ? SampleAlignment::kMsb : SampleAlignment::kLsb;
-      CHECK_OK(session->Convert(src, out.Image(align, swap)));
+      const auto align = setup.depth > 8 ? SYC_ALIGN_MSB : SYC_ALIGN_LSB;
+      CHECK_OK(session.Convert(src, out.Image(align, swap)));
       std::vector<int> Y, Cb, Cr;
       out.Read(&Y, &Cb, &Cr, setup.depth > 8 ? 16 - setup.depth : 0, swap);
       CHECK(Y == refY && Cb == refCb && Cr == refCr);
@@ -789,11 +885,20 @@ void TestFormats(cudaStream_t stream) {
   }
 }
 
-// Odd and tiny sizes must work, and the default iteration count of the
-// default filter must be the documented 6.
-void TestSizes(cudaStream_t stream) {
-  auto session = MakeSession(stream);
-  CHECK_OK(session->SetColorInfo(MakeColorInfo(kSetups[0])));
+// Odd and tiny sizes must work; the default session must be the documented
+// JPEG signal with bilinear centre and 6 iterations; duplicate filters merge
+// and weights are relative.
+void TestDefaultsAndSizes(cudaStream_t stream) {
+  Session defaults;
+  defaults.SetStream(stream).Init();
+  const Setup jpeg{"jpeg", 1, 13, 6, SYC_RANGE_FULL, 8, SYC_CHROMA_LOCATION_CENTER};
+  Session explicit_jpeg = MakeSession(stream, jpeg, {}, 6);
+  const syc_decoder_filter kCenter{SYC_FILTER_BILINEAR, SYC_CHROMA_LOCATION_CENTER};
+  const syc_decoder_filter kNearest{SYC_FILTER_NEAREST, SYC_CHROMA_LOCATION_CENTER};
+  const FilterList blend = {{1, kCenter}, {1, kNearest}};
+  const FilterList blend_dup = {{1, kCenter}, {4, kNearest}, {3, kCenter}};
+  Session a = MakeSession(stream, jpeg, blend);
+  Session b = MakeSession(stream, jpeg, blend_dup);
   for (auto [w, h] : {std::pair{1, 1}, {2, 1}, {1, 2}, {3, 3}, {129, 67}, {64, 31}}) {
     g_context = "size " + std::to_string(w) + "x" + std::to_string(h);
     const std::vector<Rgb> img = EdgeImage(w, h);
@@ -801,16 +906,9 @@ void TestSizes(cudaStream_t stream) {
     for (const Rgb& c : img)
       for (double v : {c.r, c.g, c.b}) raw.push_back(uint8_t(std::lround(v * 255)));
     DeviceBuffer in(raw);
-    const RgbImage src = RgbImage::Interleaved(in.ptr, size_t(w) * 3, w, h, SampleType::kU8);
-    YuvBuffers a(w, h, 8, false), b(w, h, 8, false);
-    CHECK_OK(session->SetFilterInfo(FilterInfo{}));  // library default
-    CHECK_OK(session->Convert(src, a.Image()));
-    CHECK_OK(session->SetFilterInfo(MakeFilter(ChromaLocation::kCenter, 6)));
-    CHECK_OK(session->Convert(src, b.Image()));
-    std::vector<int> Ya, Cba, Cra, Yb, Cbb, Crb;
-    a.Read(&Ya, &Cba, &Cra);
-    b.Read(&Yb, &Cbb, &Crb);
-    CHECK(Ya == Yb && Cba == Cbb && Cra == Crb);
+    const RgbImage src = Interleaved(in.ptr, size_t(w) * 3, w, h, SYC_SAMPLE_U8);
+    CHECK(Convert(defaults, src, 8) == Convert(explicit_jpeg, src, 8));
+    CHECK(Convert(a, src, 8) == Convert(b, src, 8));
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(cudaGetLastError());
@@ -820,28 +918,24 @@ void TestSizes(cudaStream_t stream) {
 // transparent image, and the planar layout against interleaved.
 void TestAlpha(cudaStream_t stream) {
   const int w = 37, h = 23;
-  auto session = MakeSession(stream);
   for (int depth : {8, 10}) {
     g_context = "alpha depth " + std::to_string(depth);
     Setup setup = kSetups[0];
     setup.depth = depth;
-    CHECK_OK(session->SetColorInfo(MakeColorInfo(setup)));
-    CHECK_OK(session->SetFilterInfo(FilterInfo{}));
+    Session session = MakeSession(stream, setup);
     const std::vector<float> f = RgbaImage(w, h);
     DeviceBuffer in(f);
-    RgbImage rgba = RgbImage::Interleaved(in.ptr, size_t(w) * 16, w, h, SampleType::kF32,
-                                          ChannelOrder::kRGBA);
-    rgba.alpha = AlphaSource::kInterleaved;
+    const RgbImage rgba = Interleaved(in.ptr, size_t(w) * 16, w, h, SYC_SAMPLE_F32, SYC_INTERP_RGBA);
 
     // Alpha output: the input alpha, full range at the output depth (MSB
     // aligned with the other planes).
     const size_t bytes = depth == 8 ? 1 : 2, a_pitch = size_t(w + 5) * bytes;
     DeviceBuffer a_out(a_pitch * h);
     YuvBuffers out(w, h, depth, false);
-    YuvImage dst = out.Image(depth == 8 ? SampleAlignment::kLsb : SampleAlignment::kMsb);
-    dst.alpha_data = a_out.ptr;
-    dst.alpha_pitch = a_pitch;
-    CHECK_OK(session->Convert(rgba, dst));
+    YuvImage dst = out.Image(depth == 8 ? SYC_ALIGN_LSB : SYC_ALIGN_MSB);
+    dst.data[3] = a_out.ptr;
+    dst.pitch[3] = a_pitch;
+    CHECK_OK(session.Convert(rgba, dst));
     const auto raw = a_out.Download<unsigned char>();
     const int maxv = (1 << depth) - 1, shift = depth == 8 ? 0 : 16 - depth;
     int bad = 0;
@@ -866,13 +960,11 @@ void TestAlpha(cudaStream_t stream) {
     }
     DeviceBuffer in_planar(planes);
     const float* pp = static_cast<const float*>(in_planar.ptr);
-    RgbImage planar = RgbImage::Planar(pp, pp + size_t(w) * h, pp + 2 * size_t(w) * h,
-                                       size_t(w) * 4, w, h, SampleType::kF32);
-    planar.alpha = AlphaSource::kPlane;
-    planar.alpha_data = pp + 3 * size_t(w) * h;
-    planar.alpha_pitch = size_t(w) * 4;
+    const size_t n = size_t(w) * h;
+    const RgbImage planar =
+        Planar(pp, pp + n, pp + 2 * n, size_t(w) * 4, w, h, SYC_SAMPLE_F32, pp + 3 * n);
     YuvBuffers out_planar(w, h, depth, false);
-    CHECK_OK(session->Convert(planar, out_planar.Image()));
+    CHECK_OK(session.Convert(planar, out_planar.Image()));
     std::vector<int> Y1, Cb1, Cr1, Y2, Cb2, Cr2;
     out.Read(&Y1, &Cb1, &Cr1, shift);
     out_planar.Read(&Y2, &Cb2, &Cr2);
@@ -886,9 +978,9 @@ void TestAlpha(cudaStream_t stream) {
     RgbImage op = rgba;
     op.data[0] = in_opaque.ptr;
     YuvBuffers out_a(w, h, depth, false), out_n(w, h, depth, false);
-    CHECK_OK(session->Convert(op, out_a.Image()));
-    op.alpha = AlphaSource::kNone;
-    CHECK_OK(session->Convert(op, out_n.Image()));
+    CHECK_OK(session.Convert(op, out_a.Image()));
+    op.interpretation = SYC_INTERP_RGBX;  // the same samples, alpha ignored
+    CHECK_OK(session.Convert(op, out_n.Image()));
     out_a.Read(&Y1, &Cb1, &Cr1);
     out_n.Read(&Y2, &Cb2, &Cr2);
     int worst = 0;
@@ -907,7 +999,7 @@ void TestAlpha(cudaStream_t stream) {
     RgbImage cl = rgba;
     cl.data[0] = in_clear.ptr;
     YuvBuffers out_c(w, h, depth, false);
-    CHECK_OK(session->Convert(cl, out_c.Image()));
+    CHECK_OK(session.Convert(cl, out_c.Image()));
     out_c.Read(&Y1, &Cb1, &Cr1);
     bool in_range = true;
     for (int v : Y1) in_range &= v >= 0 && v <= maxv;
@@ -925,7 +1017,12 @@ int main() {
   // where it is.
   const auto start = std::chrono::steady_clock::now();
   auto run = [&](const char* name, auto&& test) {
-    test();
+    try {
+      test();
+    } catch (const std::exception& e) {
+      ++g_failures;
+      std::printf("FAIL [%s] uncaught exception: %s\n", g_context.c_str(), e.what());
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::fprintf(stderr, "[%8.2f s] %s done\n", t, name);
@@ -933,10 +1030,11 @@ int main() {
   };
   if (Quick()) std::fprintf(stderr, "quick mode (SHARPYUV_TEST_QUICK)\n");
   run("factories", [] { TestFactories(); });
-  run("session errors", [&] { TestSessionErrors(stream); });
+  run("session init", [&] { TestSessionInit(stream); });
+  run("convert errors", [&] { TestConvertErrors(stream); });
   run("uniform", [&] { TestUniform(stream); });
   run("formats", [&] { TestFormats(stream); });
-  run("sizes", [&] { TestSizes(stream); });
+  run("defaults and sizes", [&] { TestDefaultsAndSizes(stream); });
   run("sharp quality", [&] { TestSharpQuality(stream); });
   run("tiles", [&] { TestTiles(stream); });
   run("alpha", [&] { TestAlpha(stream); });
