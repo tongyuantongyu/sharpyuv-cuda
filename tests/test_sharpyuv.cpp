@@ -461,6 +461,10 @@ void TestConvertErrors(cudaStream_t stream) {
   CHECK_STATUS(syc_session_convert(nullptr, &src, nullptr), SYC_STATUS_INVALID_ARGUMENT);
   YuvBuffers out7(7, 8, 8, false);
   CHECK_STATUS(s.Convert(src, out7.Image()), SYC_STATUS_INVALID_ARGUMENT);  // size mismatch
+  YuvBuffers out9(9, 9, 8, false);
+  CHECK_STATUS(s.Convert(src, out9.Image()), SYC_STATUS_INVALID_ARGUMENT);  // even input: no padding
+  const RgbImage src7 = Interleaved(in.ptr, 24, 7, 7, SYC_SAMPLE_U8);
+  CHECK_STATUS(s.Convert(src7, out9.Image()), SYC_STATUS_INVALID_ARGUMENT);  // padding > 1
   // Above the supported size (checked before any pointer is used).
   const int huge = (1 << 16) + 1;
   const RgbImage huge_src = Interleaved(in.ptr, size_t(huge) * 3, huge, 1, SYC_SAMPLE_U8);
@@ -1008,6 +1012,61 @@ void TestAlpha(cudaStream_t stream) {
   CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+// Odd input, output padded to even: the same samples as the unpadded
+// output, plus a replicated last row / column of Y and A; same chroma.
+void TestPadding(cudaStream_t stream) {
+  const int w = 37, h = 23;
+  const std::vector<float> f = RgbaImage(w, h);
+  DeviceBuffer in(f);
+  const RgbImage rgba = Interleaved(in.ptr, size_t(w) * 16, w, h, SYC_SAMPLE_F32, SYC_INTERP_RGBA);
+  for (int depth : {8, 10}) {
+    Setup setup = kSetups[depth == 8 ? 0 : 2];
+    Session session = MakeSession(stream, setup);
+    const size_t bytes = depth == 8 ? 1 : 2;
+    struct Result {
+      std::vector<int> y, cb, cr, a;
+    };
+    auto run = [&](int ow, int oh) {
+      const size_t a_pitch = size_t(ow + 3) * bytes;
+      DeviceBuffer a_out(a_pitch * oh);
+      YuvBuffers out(ow, oh, depth, false);
+      YuvImage dst = out.Image();
+      dst.data[3] = a_out.ptr;
+      dst.pitch[3] = a_pitch;
+      CHECK_OK(session.Convert(rgba, dst));
+      Result r;
+      out.Read(&r.y, &r.cb, &r.cr);
+      const auto raw = a_out.Download<unsigned char>();
+      for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+          uint16_t v = raw[y * a_pitch + x * bytes];
+          if (bytes == 2) std::memcpy(&v, &raw[y * a_pitch + x * 2], 2);
+          r.a.push_back(v);
+        }
+      }
+      return r;
+    };
+    const Result base = run(w, h);
+    for (int pad = 1; pad < 4; ++pad) {
+      const int ow = w + (pad & 1), oh = h + (pad >> 1);
+      g_context = "padding depth " + std::to_string(depth) + " " + std::to_string(ow) + "x" +
+                  std::to_string(oh);
+      const Result r = run(ow, oh);
+      CHECK(r.cb == base.cb && r.cr == base.cr);
+      int bad = 0;
+      for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+          const size_t src = size_t(std::min(y, h - 1)) * w + std::min(x, w - 1);
+          const size_t dst = size_t(y) * ow + x;
+          bad += r.y[dst] != base.y[src] || r.a[dst] != base.a[src];
+        }
+      }
+      CHECK(bad == 0);
+    }
+  }
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 }  // namespace
 
 int main() {
@@ -1038,6 +1097,7 @@ int main() {
   run("sharp quality", [&] { TestSharpQuality(stream); });
   run("tiles", [&] { TestTiles(stream); });
   run("alpha", [&] { TestAlpha(stream); });
+  run("padding", [&] { TestPadding(stream); });
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(cudaStreamDestroy(stream));
   if (g_failures == 0) {

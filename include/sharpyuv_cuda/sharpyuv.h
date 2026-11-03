@@ -353,7 +353,9 @@ typedef enum syc_sample_alignment {
  * and pitches must be multiples of the sample size, and a pitch must cover
  * a row. */
 typedef struct syc_yuv_image {
-  int32_t width; /* equal to the input's */
+  // Equal to the input's; or, for an odd input width / height, 1 larger
+  // (padded to even): the last row / column of Y (and A) is replicated.
+  int32_t width;
   int32_t height;
   void* data[4];
   size_t pitch[4];

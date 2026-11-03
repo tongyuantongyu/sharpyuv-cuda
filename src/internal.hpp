@@ -104,8 +104,10 @@ struct OutputDesc {
 };
 
 struct Geometry {
-  int32_t width, height;  // image
-  int32_t bw, bh;         // blocks: ceil(width / 2), ceil(height / 2)
+  int32_t width, height;          // input image
+  int32_t bw, bh;                 // blocks: ceil(width / 2), ceil(height / 2)
+  int32_t out_width, out_height;  // output: the input's, or padded to even
+                                  // (the last row / column replicated)
 };
 
 // ---------------------------------------------------------------------------

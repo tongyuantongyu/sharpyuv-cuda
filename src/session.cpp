@@ -409,7 +409,11 @@ syc_status syc_session_convert(syc_session* session, const syc_rgb_image* src,
   if (s == nullptr) return SYC_STATUS_INVALID_ARGUMENT;
   if (!s->ready) return SYC_STATUS_NOT_READY;
   const int32_t w = src->width, h = src->height;
-  if (w < 1 || h < 1 || dst->width != w || dst->height != h) return SYC_STATUS_INVALID_ARGUMENT;
+  // Output: the input's size, or padded to even.
+  auto size_ok = [](int32_t in, int32_t out) { return out == in || (in % 2 == 1 && out == in + 1); };
+  if (w < 1 || h < 1 || !size_ok(w, dst->width) || !size_ok(h, dst->height)) {
+    return SYC_STATUS_INVALID_ARGUMENT;
+  }
   if (w > kMaxDimension || h > kMaxDimension) return SYC_STATUS_IMAGE_TOO_LARGE;
 
   InputDesc in{};
@@ -419,7 +423,7 @@ syc_status syc_session_convert(syc_session* session, const syc_rgb_image* src,
   st = BuildOutput(*dst, s->color.depth, in.alpha != 0, &out);
   if (st != SYC_STATUS_OK) return st;
 
-  const Geometry geo{w, h, (w + 1) / 2, (h + 1) / 2};
+  const Geometry geo{w, h, (w + 1) / 2, (h + 1) / 2, dst->width, dst->height};
   ColorParams cp = s->color;
   DeviceGuard guard(s->device);
   const KernelConfig& kc = InternalKernelConfig();

@@ -478,7 +478,8 @@ __device__ __forceinline__ void StoreSample(unsigned char* row, int index,
 }
 
 // Alpha output of a block's pixels inside the image: full range at the
-// output depth. a[sy][sx]: alpha in [0, 1].
+// output depth (padding replicates the last row / column). a[sy][sx]:
+// alpha in [0, 1].
 __device__ __forceinline__ void StoreAlphaBlock(const ColorParams& cp, const OutputDesc& out,
                                                 const Geometry& geo, int bx, int by,
                                                 const float a[2][2]) {
@@ -486,31 +487,36 @@ __device__ __forceinline__ void StoreAlphaBlock(const ColorParams& cp, const Out
 #pragma unroll
   for (int sy = 0; sy < 2; ++sy) {
     const int y = 2 * by + sy;
-    if (y >= geo.height) break;
+    if (y >= geo.out_height) break;
+    const int ry = y < geo.height ? sy : 0;  // padding row: replicate
     unsigned char* row = out.a + size_t(y) * out.a_pitch;
 #pragma unroll
     for (int sx = 0; sx < 2; ++sx) {
       const int x = 2 * bx + sx;
-      if (x >= geo.width) break;
-      StoreSample(row, x, a[sy][sx] * maxv, cp, out.shift);
+      if (x >= geo.out_width) break;
+      const int rx = x < geo.width ? sx : 0;  // padding column: replicate
+      StoreSample(row, x, a[ry][rx] * maxv, cp, out.shift);
     }
   }
 }
 
-// Quantize and store a block's Y (pixels inside the image) and Cb/Cr.
+// Quantize and store a block's Y (pixels inside the output; padding
+// replicates the last row / column) and Cb/Cr.
 __device__ __forceinline__ void StoreBlock(const ColorParams& cp, const OutputDesc& out,
                                            const Geometry& geo, int bx, int by,
                                            const float w[2][2], Chroma d) {
 #pragma unroll
   for (int sy = 0; sy < 2; ++sy) {
     const int y = 2 * by + sy;
-    if (y >= geo.height) break;
+    if (y >= geo.out_height) break;
+    const int ry = y < geo.height ? sy : 0;  // padding row: replicate
     unsigned char* row = out.y + size_t(y) * out.y_pitch;
 #pragma unroll
     for (int sx = 0; sx < 2; ++sx) {
       const int x = 2 * bx + sx;
-      if (x >= geo.width) break;
-      StoreSample(row, x, fmaf(Clamp01(w[sy][sx]), cp.y_scale, cp.y_offset), cp, out.shift);
+      if (x >= geo.out_width) break;
+      const int rx = x < geo.width ? sx : 0;  // padding column: replicate
+      StoreSample(row, x, fmaf(Clamp01(w[ry][rx]), cp.y_scale, cp.y_offset), cp, out.shift);
     }
   }
   const float cb = fmaf(d.b * cp.u_coef, cp.c_scale, cp.c_offset);
